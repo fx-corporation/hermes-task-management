@@ -2,9 +2,10 @@ import express, { type Express, type Request, type ErrorRequestHandler } from "e
 import {
   PLATFORM,
   type TaskStatus,
+  type Platform,
 } from "./domain.ts";
 import {
-  InMemoryHermesAdapter,
+  PlatformAdapterRegistry,
   StubPlatformAdapter,
   exactKeys,
   isRecord,
@@ -12,7 +13,8 @@ import {
   type HermesDeliveryAdapter,
   type PlatformAdapter,
 } from "./adapters.ts";
-import { WahaPlatformAdapter } from "./waha-adapter.ts";
+import { HttpHermesAdapter, hermesFromEnvironment, type HttpHermesAdapterOptions } from "./http-hermes-adapter.ts";
+import { WahaPlatformAdapter, isWahaLid } from "./waha-adapter.ts";
 import { ApiError, invalidRequest } from "./errors.ts";
 import { InMemoryStore } from "./store.ts";
 import { TaskService } from "./task-service.ts";
@@ -22,22 +24,34 @@ export interface ApplicationOptions {
   webhookToken: string;
   store?: InMemoryStore;
   platform?: PlatformAdapter;
+  platforms?: PlatformAdapter[];
+  defaultPlatform?: Platform;
+  webhookTokens?: Partial<Record<Platform, string>>;
   hermes?: HermesDeliveryAdapter;
+  hermesOptions?: HttpHermesAdapterOptions;
 }
 
 export interface Application {
   app: Express;
   service: TaskService;
   store: InMemoryStore;
-  platform: PlatformAdapter;
+  platforms: PlatformAdapterRegistry;
   hermes: HermesDeliveryAdapter;
 }
 
 export function createApplication(options: ApplicationOptions): Application {
   const store = options.store ?? new InMemoryStore();
-  const platform = options.platform ?? new StubPlatformAdapter(store);
-  const hermes = options.hermes ?? new InMemoryHermesAdapter();
-  const service = new TaskService(store, platform, hermes);
+  const overrides = new Map((options.platforms ?? []).map(adapter => [adapter.platform, adapter]));
+  console.log("App starting with options:", options);
+  if (options.platform) overrides.set(options.platform.platform, options.platform);
+  const platforms = new PlatformAdapterRegistry([
+    overrides.get("stub") ?? new StubPlatformAdapter(store),
+    overrides.get("waha") ?? new WahaPlatformAdapter(store, { baseUrl: "http://localhost:3000", apiKey: "" }),
+  ]);
+  const defaultPlatform = options.defaultPlatform ?? options.platform?.platform ?? "stub";
+  const webhookToken = (platform: Platform) => options.webhookTokens?.[platform] ?? options.webhookToken;
+  const hermes = options.hermes ?? (options.hermesOptions ? new HttpHermesAdapter(options.hermesOptions) : hermesFromEnvironment(process.env));
+  const service = new TaskService(store, platforms, hermes);
   const app = express();
   app.disable("x-powered-by");
   app.enable("strict routing");
@@ -47,6 +61,7 @@ export function createApplication(options: ApplicationOptions): Application {
     const requestId = crypto.randomUUID();
     const startedAt = performance.now();
     const context = { requestId, method: request.method, url: `${request.protocol}://${request.get("host")}${request.originalUrl}` };
+    response.locals.requestContext = context;
     console.log("HTTP request", { ...context, timestamp: new Date().toISOString() });
     const send = response.send.bind(response);
     let body: unknown;
@@ -66,26 +81,39 @@ export function createApplication(options: ApplicationOptions): Application {
 
   // Keep the exact bytes for WAHA's HMAC, including whitespace; do not inflate bodies.
   const rawBody = express.raw({ type: () => true, limit: "1mb", inflate: false });
-  if (platform instanceof WahaPlatformAdapter) {
-    app.post("/webhooks/waha", rawBody, async (request, response) => {
-      const body = await platform.readWebhook(request, options.webhookToken);
-      response.json({ success: true, ...await service.receiveInbound(body) });
+  app.use("/webhooks", rawBody, (request, response, next) => {
+    const raw = Buffer.isBuffer(request.body) ? request.body.toString("utf8") : "";
+    let payload: unknown = raw;
+    try { payload = JSON.parse(raw); } catch { /* Log malformed bodies as received. */ }
+    console.log("HTTP webhook payload", {
+      ...response.locals.requestContext,
+      timestamp: new Date().toISOString(),
+      payload,
+    });
+    next();
+  });
+  const waha = platforms.get("waha");
+  if (waha instanceof WahaPlatformAdapter) {
+    app.post("/webhooks/waha", async (request, response) => {
+      const body = await waha.readWebhook(request, webhookToken("waha"));
+      response.json({ success: true, ...await service.receiveInbound("waha", body) });
     });
   }
 
   app.use((request, _response, next) => {
-    const isWebhook = request.path === `/webhooks/${platform.platform}`;
-    authorize(request, isWebhook ? options.webhookToken : options.apiToken, isWebhook);
+    const isWebhook = request.path === "/webhooks/stub";
+    authorize(request, isWebhook ? webhookToken("stub") : options.apiToken, isWebhook);
     next();
   });
   app.use(rawBody);
   app.post("/tasks", async (request, response) => {
     const body = await readObject(request);
     exactKeys(body, ["hermesSessionId", "platform", "conversationId", "title"]);
+    const platform = platforms.get(requiredString(body.platform, "platform", 100));
     const task = service.createTask({
       hermesSessionId: requiredString(body.hermesSessionId, "hermesSessionId", 200),
-      platform: requiredString(body.platform, "platform", 100),
-      conversationId: validatePhoneNumber(body.conversationId),
+      platform: platform.platform,
+      conversationId: validateConversationId(body.conversationId, platform.platform),
       title: requiredString(body.title, "title", 300),
     });
     return response.status(201).json({ success: true, task });
@@ -99,11 +127,9 @@ export function createApplication(options: ApplicationOptions): Application {
       ? statusValue
       : undefined;
     const platformValue = url.searchParams.get("platform") ?? undefined;
-    if (platformValue && platformValue !== platform.platform) {
-      throw new ApiError(400, "PLATFORM_NOT_SUPPORTED", "The requested platform is not configured.");
-    }
+    if (platformValue) platforms.get(platformValue);
     const conversationId = url.searchParams.has("conversationId")
-      ? validatePhoneNumber(url.searchParams.get("conversationId"))
+      ? validateConversationId(url.searchParams.get("conversationId"), platformValue)
       : undefined;
     const hermesSessionId = url.searchParams.has("hermesSessionId")
       ? requiredString(url.searchParams.get("hermesSessionId"), "hermesSessionId", 200)
@@ -147,20 +173,16 @@ export function createApplication(options: ApplicationOptions): Application {
   app.get("/conversations", async (request, response) => {
     const url = new URL(request.originalUrl, "http://localhost");
     const platformValue = url.searchParams.get("platform");
-    if (platformValue && platformValue !== platform.platform) {
-      throw new ApiError(400, "PLATFORM_NOT_SUPPORTED", "The requested platform is not configured.");
-    }
+    const platform = platforms.get(platformValue ?? defaultPlatform);
     const search = url.searchParams.get("search") ?? undefined;
     return response.json({ success: true, conversations: await platform.listConversations(search) });
   });
 
   app.get("/conversations/:conversationId/actions", async (request, response) => {
     const url = new URL(request.originalUrl, "http://localhost");
-    const conversationId = validatePhoneNumber(request.params.conversationId);
-    const platformValue = url.searchParams.get("platform") ?? platform.platform;
-    if (platformValue !== platform.platform) {
-      throw new ApiError(400, "PLATFORM_NOT_SUPPORTED", "The requested platform is not configured.");
-    }
+    const platformValue = url.searchParams.get("platform") ?? defaultPlatform;
+    const platform = platforms.get(platformValue);
+    const conversationId = validateConversationId(request.params.conversationId, platform.platform);
     if (!store.getConversation(platform.platform, conversationId)) {
       throw new ApiError(404, "CONVERSATION_NOT_FOUND", "The requested conversation does not exist.");
     }
@@ -172,7 +194,8 @@ export function createApplication(options: ApplicationOptions): Application {
     });
   });
 
-  if (platform.platform === "stub") {
+  {
+    const platform = platforms.get("stub");
     app.post("/stub/conversations", async (request, response) => {
       const body = await readObject(request);
       exactKeys(body, ["conversationId", "displayName"]);
@@ -197,7 +220,7 @@ export function createApplication(options: ApplicationOptions): Application {
       const externalMessageId = body.externalMessageId === undefined
         ? `stub_${crypto.randomUUID()}`
         : requiredString(body.externalMessageId, "externalMessageId", 300);
-      const outcome = await service.receiveInbound({ conversationId, externalMessageId, message });
+      const outcome = await service.receiveInbound("stub", { conversationId, externalMessageId, message });
       return response.json({ success: true, ...outcome });
     });
 
@@ -207,7 +230,7 @@ export function createApplication(options: ApplicationOptions): Application {
       validatePhoneNumber(body.conversationId);
       requiredString(body.externalMessageId, "externalMessageId", 300);
       requiredString(body.message, "message");
-      const outcome = await service.receiveInbound(body);
+      const outcome = await service.receiveInbound("stub", body);
       return response.json({ success: true, ...outcome });
     });
   }
@@ -232,12 +255,12 @@ export function createApplication(options: ApplicationOptions): Application {
     });
   };
   app.use(handleError);
-  return { app, service, store, platform, hermes };
+  return { app, service, store, platforms, hermes };
 }
 
 function authorize(request: Request, token: string, webhook: boolean): void {
   const authorization = request.get("authorization");
-  if (authorization !== `Bearer ${token}`) {
+  if (!token || authorization !== `Bearer ${token}`) {
     throw new ApiError(
       401,
       webhook ? "WEBHOOK_AUTHENTICATION_FAILED" : "UNAUTHORIZED",
@@ -272,4 +295,12 @@ function validatePhoneNumber(value: unknown): string {
 
 function isTaskStatus(value: string): value is TaskStatus {
   return value === "ACTIVE" || value === "WAITING_EXTERNAL_REPLY" || value === "COMPLETED" || value === "CANCELLED";
+}
+
+function validateConversationId(value: unknown, platform?: string): string {
+  if (platform === "waha" || (!platform && isWahaLid(value))) {
+    if (!isWahaLid(value) || value.length > 200) throw invalidRequest('WAHA "conversationId" must be a numeric identifier ending in @lid.');
+    return value;
+  }
+  return validatePhoneNumber(value);
 }

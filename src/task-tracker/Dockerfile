@@ -6,7 +6,7 @@ RUN bun install --frozen-lockfile
 COPY tsconfig.json ./
 COPY src ./src
 COPY test ./test
-RUN bun run typecheck && bun test
+RUN bun run typecheck && bun run test
 RUN bun run build
 
 FROM oven/bun:1.4.2 AS runtime

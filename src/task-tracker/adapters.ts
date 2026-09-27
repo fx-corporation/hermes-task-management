@@ -29,6 +29,7 @@ export class StubPlatformAdapter implements PlatformAdapter {
     const normalized = search?.trim().toLocaleLowerCase();
     return [...this.store.conversations.values()]
       .filter((conversation) => {
+        if (conversation.platform !== this.platform) return false;
         if (!normalized) return true;
         return `${conversation.displayName} ${conversation.conversationId}`
           .toLocaleLowerCase()
@@ -102,5 +103,24 @@ export function exactKeys(
   const unexpected = Object.keys(body).filter((key) => !allowed.has(key));
   if (unexpected.length > 0) {
     throw invalidRequest(`Unexpected field${unexpected.length === 1 ? "" : "s"}: ${unexpected.join(", ")}.`);
+  }
+}
+
+export class PlatformAdapterRegistry {
+  private readonly adapters = new Map<Platform, PlatformAdapter>();
+
+  constructor(adapters: PlatformAdapter[]) {
+    for (const adapter of adapters) this.register(adapter);
+  }
+
+  register(adapter: PlatformAdapter): void {
+    if (this.adapters.has(adapter.platform)) throw new Error(`Platform adapter already registered: ${adapter.platform}`);
+    this.adapters.set(adapter.platform, adapter);
+  }
+
+  get(platform: string): PlatformAdapter {
+    const adapter = this.adapters.get(platform as Platform);
+    if (!adapter) throw new ApiError(400, "PLATFORM_NOT_SUPPORTED", "The requested platform is not registered.");
+    return adapter;
   }
 }

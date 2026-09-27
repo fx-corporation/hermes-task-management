@@ -4,20 +4,32 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun --watch src/server.ts",
-    "start": "bun src/server.ts",
+    "dev": "bun --watch src/task-tracker/server.ts",
+    "start": "bun src/task-tracker/server.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test",
-    "build": "bun build src/server.ts --target=bun --outdir=dist"
+    "test": "bun run build:hermes-ui && bun test",
+    "build": "bun build src/task-tracker/server.ts --target=bun --outdir=dist",
+    "dev:hermes-stub": "bun run build:hermes-ui && bun --watch src/hermes-stub/server.ts",
+    "dev:hermes": "bun --watch src/task-tracker/server.ts",
+    "build:hermes-ui": "vite build --config src/hermes-stub/vite.config.ts",
+    "dev:hermes-ui": "vite --config src/hermes-stub/vite.config.ts"
   },
   "devDependencies": {
+    "@testing-library/react": "^16.3.3",
     "@types/bun": "^1.2.22",
     "@types/express": "^5.0.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "@types/supertest": "^7.2.1",
+    "@vitejs/plugin-react": "^6.1.1",
+    "happy-dom": "^20.14.5",
     "supertest": "^7.3.0",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "vite": "^8.3.1"
   },
   "dependencies": {
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
   }
 }

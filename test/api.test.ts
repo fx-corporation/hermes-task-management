@@ -1,17 +1,18 @@
 import supertest from "supertest";
 import { fetchApplication } from "./helpers.ts";
 import { describe, expect, test } from "bun:test";
-import { createApplication } from "../src/app.ts";
-import { InMemoryHermesAdapter } from "../src/adapters.ts";
-import type { HermesDelivery } from "../src/domain.ts";
-import { startServer } from "../src/server.ts";
+import { createApplication } from "../src/task-tracker/app.ts";
+import { InMemoryHermesAdapter } from "../src/task-tracker/adapters.ts";
+import type { HermesDelivery } from "../src/task-tracker/domain.ts";
+import { HttpHermesAdapter } from "../src/task-tracker/http-hermes-adapter.ts";
+import { startServer } from "../src/task-tracker/server.ts";
 
 const API_TOKEN = "test-api-token";
 const WEBHOOK_TOKEN = "test-webhook-token";
 const DENTAL = "+12025550101";
 
 function setup() {
-  const app = createApplication({ apiToken: API_TOKEN, webhookToken: WEBHOOK_TOKEN });
+  const app = createApplication({ apiToken: API_TOKEN, webhookToken: WEBHOOK_TOKEN, hermes: new InMemoryHermesAdapter() });
   return { app, hermes: app.hermes as InMemoryHermesAdapter };
 }
 
@@ -292,6 +293,7 @@ describe("task management API", () => {
     const { server, app } = startServer({
       MESSAGING_TASK_API_TOKEN: API_TOKEN,
       STUB_WEBHOOK_TOKEN: WEBHOOK_TOKEN,
+      HERMES_API_KEY: "test-hermes-key",
       PORT: "0",
     });
     await new Promise<void>((resolve, reject) => {
@@ -309,6 +311,7 @@ describe("task management API", () => {
       });
       expect((await json(conversations)).conversations).toHaveLength(2);
       expect(app.store.conversations.size).toBe(2);
+      expect(app.hermes).toBeInstanceOf(HttpHermesAdapter);
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }
@@ -340,6 +343,7 @@ describe("task management API", () => {
   test("returns structured errors for rejected asynchronous Express handlers", async () => {
     const app = createApplication({
       apiToken: API_TOKEN, webhookToken: WEBHOOK_TOKEN,
+      hermes: new InMemoryHermesAdapter(),
       platform: {
         platform: "stub",
         async listConversations() { throw new Error("Unexpected provider failure"); },

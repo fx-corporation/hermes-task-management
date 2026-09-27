@@ -8,7 +8,7 @@ import {
   type MessagingTask,
   type TaskStatus,
 } from "./domain.ts";
-import type { HermesDeliveryAdapter, PlatformAdapter } from "./adapters.ts";
+import type { HermesDeliveryAdapter, PlatformAdapterRegistry } from "./adapters.ts";
 import { ApiError } from "./errors.ts";
 import { InMemoryStore } from "./store.ts";
 
@@ -25,7 +25,7 @@ export class TaskService {
 
   constructor(
     readonly store: InMemoryStore,
-    readonly platform: PlatformAdapter,
+    readonly platforms: PlatformAdapterRegistry,
     readonly hermes: HermesDeliveryAdapter,
   ) {}
 
@@ -35,13 +35,11 @@ export class TaskService {
     conversationId: string;
     title: string;
   }): MessagingTask {
-    if (input.platform !== this.platform.platform) {
-      throw new ApiError(400, "PLATFORM_NOT_SUPPORTED", "The requested platform is not configured.");
-    }
-    if (!this.store.getConversation(this.platform.platform, input.conversationId)) {
+    const platform = this.platforms.get(input.platform);
+    if (!this.store.getConversation(platform.platform, input.conversationId)) {
       throw new ApiError(404, "CONVERSATION_NOT_FOUND", "The requested conversation does not exist.");
     }
-    const key = conversationKey(this.platform.platform, input.conversationId);
+    const key = conversationKey(platform.platform, input.conversationId);
     const currentTaskId = this.store.activeTaskByConversation.get(key);
     if (currentTaskId) {
       throw new ApiError(
@@ -57,7 +55,7 @@ export class TaskService {
     const task: MessagingTask = {
       id: `task_${crypto.randomUUID()}`,
       title: input.title,
-      platform: this.platform.platform,
+      platform: platform.platform,
       conversationId: input.conversationId,
       hermesSessionId: input.hermesSessionId,
       status: "ACTIVE",
@@ -100,7 +98,7 @@ export class TaskService {
     task.status = "WAITING_EXTERNAL_REPLY";
     task.updatedAt = new Date().toISOString();
     try {
-      await this.platform.sendMessage(task, message);
+      await this.platforms.get(task.platform).sendMessage(task, message);
     } catch (error) {
       if (task.status === "WAITING_EXTERNAL_REPLY") {
         task.status = "ACTIVE";
@@ -150,13 +148,13 @@ export class TaskService {
     return task;
   }
 
-  async receiveInbound(payload: unknown): Promise<{
+  async receiveInbound(platform: string, payload: unknown): Promise<{
     eventId: string | null;
     outcome: EventOutcome | "IGNORED_EVENT";
     duplicate: boolean;
     taskId: string | null;
   }> {
-    const message = this.platform.normalizeInbound(payload);
+    const message = this.platforms.get(platform).normalizeInbound(payload);
     if (!message) return { eventId: null, outcome: "IGNORED_EVENT", duplicate: false, taskId: null };
     const deduplicationKey = `${message.platform}\u0000${message.externalMessageId}`;
     const previous = this.store.inboundEvents.get(deduplicationKey);
@@ -194,6 +192,7 @@ export class TaskService {
     this.store.inboundEvents.set(deduplicationKey, event);
 
     if (!task) {
+      console.warn(`Inbound message ${message.externalMessageId} for ${message.platform} conversation ${message.conversationId} has no active task.`);
       return { eventId: event.id, outcome: event.outcome, duplicate: false, taskId: null };
     }
 
@@ -204,7 +203,7 @@ export class TaskService {
       this.eventCompletions.delete(deduplicationKey);
     }
     if (event.outcome === "DELIVERY_FAILED") {
-      throw new ApiError(502, "HERMES_DELIVERY_FAILED", "The simulated Hermes delivery failed.");
+      throw new ApiError(502, "HERMES_DELIVERY_FAILED", "Hermes delivery failed after the configured attempts.");
     }
 
     return {

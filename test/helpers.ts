@@ -1,5 +1,5 @@
 import supertest from "supertest";
-import type { Application } from "../src/app.ts";
+import type { Application } from "../src/task-tracker/app.ts";
 
 // Exercise Express over HTTP while keeping the Web Response assertions shared by the tests.
 export async function fetchApplication(application: Application, request: Request): Promise<Response> {
