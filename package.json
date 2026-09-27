@@ -1,0 +1,23 @@
+{
+  "name": "hermes-task-management",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/server.ts",
+    "start": "bun src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "build": "bun build src/server.ts --target=bun --outdir=dist"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.22",
+    "@types/express": "^5.0.6",
+    "@types/supertest": "^7.2.1",
+    "supertest": "^7.3.0",
+    "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}
