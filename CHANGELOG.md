@@ -9,6 +9,17 @@ Repository-wide instructions are in [AGENTS.md](AGENTS.md).
 
 ## Unreleased
 
+### 2026-09-28 — Use slim Bun image for task-tracker runtime
+
+- **Agent:** Codex
+- **Changes:** Changed the runtime stage in `src/task-tracker/Dockerfile` to
+  use `oven/bun:1.4.2-slim`.
+- **Why:** Reduce the final image's base size while keeping the pinned Bun
+  version. Docker Hub lists the amd64 slim image at about 68 MB compressed,
+  compared with about 88 MB for the regular image.
+- **Validation:** Inspected the Dockerfile and changelog diff. Did not build or
+  run the container because implementation verification was not requested.
+
 ### 2026-09-27 — Use LIDs as WAHA conversation identifiers
 
 - **Agent:** Codex
