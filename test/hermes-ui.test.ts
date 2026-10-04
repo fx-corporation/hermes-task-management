@@ -37,8 +37,8 @@ test("UI API creates, sends through WAHA, displays authenticated webhook replies
     expect(await script.text()).toContain("Reply inbox");
     expect(page).not.toContain("api-secret");
     expect((await call("api/tracker/conversations?platform=waha")).data.conversations).toHaveLength(1);
-    const task = (await call("api/tracker/tasks", { platform: "waha", conversationId: "12025550101@lid", hermesSessionId: "ui-session", title: "Book" })).data.task;
-    expect((await call(`api/tracker/tasks/${task.id}/send`, { message: "Available?" })).status).toBe(200);
+    const task = (await call("api/tracker/tasks", { platform: "waha", conversationId: "12025550101@lid", hermesSessionId: "ui-session", description: "Book a dental appointment; waiting to ask about availability." })).data.task;
+    expect((await call(`api/tracker/tasks/${task.id}`, { platform: "waha", conversationId: task.conversationId, message: "Available?", description: "Book a dental appointment; asked about availability." })).status).toBe(200);
     expect(sends).toEqual([{ session: "default", chatId: "12025550101@lid", text: "Available?" }]);
     const event = { event: "message", session: "default", payload: { id: "reply", from: "12025550101@lid", fromMe: false, body: "Confirmed <script>alert(1)</script>", timestamp: 1750000000 } };
     expect((await call("webhooks/waha", event)).status).toBe(401);
@@ -58,7 +58,9 @@ test("UI API creates, sends through WAHA, displays authenticated webhook replies
     } finally { streamAbort.abort(); await reader.cancel().catch(() => {}); }
     const inbox = (await call("api/events")).data.events.filter((e: any) => e.direction === "received");
     expect(inbox).toHaveLength(1);
-    expect(inbox[0].message).toBe(event.payload.body);
+    expect(inbox[0].message).toContain(`A new external message has been received for delegated messaging task ${task.id}.`);
+    expect(inbox[0].message).toContain(`<external-message>\n${event.payload.body}\n</external-message>`);
+    expect(inbox[0].message).toContain("Continue the existing delegated task");
     expect((await call("api/tracker/tasks")).data.tasks[0].status).toBe("ACTIVE");
     expect(inbox[0].sessionId).toBe("ui-session");
     expect(inbox[0].taskId).toBe(task.id);
@@ -72,7 +74,7 @@ test("UI API creates, sends through WAHA, displays authenticated webhook replies
     } finally { reconnect.abort(); await replayReader.cancel().catch(() => {}); }
     expect((await call("api/tracker/conversations/12025550101%40lid/actions?platform=waha")).status).toBe(404);
     expect((await call(`api/tracker/tasks/${task.id}/complete`, { result: "Booked" })).data.status).toBe("COMPLETED");
-    const next = (await call("api/tracker/tasks", { platform: "waha", conversationId: "12025550101@lid", hermesSessionId: "ui-session", title: "Next" })).data.task;
+    const next = (await call("api/tracker/tasks", { platform: "waha", conversationId: "12025550101@lid", hermesSessionId: "ui-session", description: "Follow up next week." })).data.task;
     expect((await call(`api/tracker/tasks/${next.id}/cancel`, { reason: "Changed plans" })).data.status).toBe("CANCELLED");
     expect(logs.some(r => String(r.url).endsWith("/api/sessions/ui-session/chat"))).toBe(true);
   } finally {

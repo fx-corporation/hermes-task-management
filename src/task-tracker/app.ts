@@ -1,4 +1,4 @@
-import express, { type Express, type Request, type ErrorRequestHandler } from "express";
+import express, { type Express, type Request, type Response as ExpressResponse, type ErrorRequestHandler } from "express";
 import {
   PLATFORM,
   type TaskStatus,
@@ -18,6 +18,7 @@ import { WahaPlatformAdapter, isWahaLid } from "./waha-adapter.ts";
 import { ApiError, invalidRequest } from "./errors.ts";
 import { InMemoryStore } from "./store.ts";
 import { TaskService } from "./task-service.ts";
+import { HttpTaskClassifier, UnavailableTaskClassifier, type TaskClassifier } from "./task-classifier.ts";
 
 export interface ApplicationOptions {
   apiToken: string;
@@ -29,6 +30,10 @@ export interface ApplicationOptions {
   webhookTokens?: Partial<Record<Platform, string>>;
   hermes?: HermesDeliveryAdapter;
   hermesOptions?: HttpHermesAdapterOptions;
+  taskClassifier?: TaskClassifier;
+  taskTrackerUrl?: string;
+  taskClassifierModel?: string;
+  taskClassifierThreshold?: number;
 }
 
 export interface Application {
@@ -37,6 +42,7 @@ export interface Application {
   store: InMemoryStore;
   platforms: PlatformAdapterRegistry;
   hermes: HermesDeliveryAdapter;
+  classifier: TaskClassifier;
 }
 
 export function createApplication(options: ApplicationOptions): Application {
@@ -50,8 +56,41 @@ export function createApplication(options: ApplicationOptions): Application {
   ]);
   const defaultPlatform = options.defaultPlatform ?? options.platform?.platform ?? "stub";
   const webhookToken = (platform: Platform) => options.webhookTokens?.[platform] ?? options.webhookToken;
+  const hermesEnvironment = process.env;
+  const hermesOptions = options.hermesOptions ?? {
+    baseUrl: hermesEnvironment.HERMES_BASE_URL ?? "http://127.0.0.1:8643",
+    apiKey: hermesEnvironment.HERMES_API_KEY ?? "",
+    timeoutMs: hermesEnvironment.HERMES_TIMEOUT_MS === undefined ? 120_000 : Number(hermesEnvironment.HERMES_TIMEOUT_MS.trim() || NaN),
+    maxRetries: hermesEnvironment.HERMES_MAX_RETRIES === undefined ? 3 : Number(hermesEnvironment.HERMES_MAX_RETRIES.trim() || NaN),
+  };
   const hermes = options.hermes ?? (options.hermesOptions ? new HttpHermesAdapter(options.hermesOptions) : hermesFromEnvironment(process.env));
-  const service = new TaskService(store, platforms, hermes);
+  const classifier = options.taskClassifier ?? (hermesOptions.apiKey.trim()
+    ? new HttpTaskClassifier({
+      ...hermesOptions,
+      store,
+      classifierBaseUrl: hermesEnvironment.TASK_CLASSIFIER_BASE_URL ?? hermesOptions.baseUrl,
+      classifierApiKey: hermesEnvironment.TASK_CLASSIFIER_API_KEY ?? (hermesEnvironment.TASK_CLASSIFIER_BASE_URL ? "ollama" : hermesOptions.apiKey),
+      trackerUrl: options.taskTrackerUrl ?? hermesEnvironment.TASK_TRACKER_BASE_URL ?? "http://127.0.0.1:9005",
+      model: options.taskClassifierModel ?? hermesEnvironment.TASK_CLASSIFIER_MODEL ?? (hermesEnvironment.TASK_CLASSIFIER_BASE_URL ? "gemma4:e4b" : "hermes-agent"),
+      threshold: options.taskClassifierThreshold ?? (hermesEnvironment.TASK_CLASSIFIER_THRESHOLD === undefined
+        ? 0.8 : Number(hermesEnvironment.TASK_CLASSIFIER_THRESHOLD.trim() || NaN)),
+    })
+    : new UnavailableTaskClassifier(store));
+  const service = new TaskService(store, platforms, hermes, classifier);
+  const respondToInbound = async (platform: string, payload: unknown, response: ExpressResponse) => {
+    try {
+      return response.json({ success: true, ...await service.receiveInbound(platform, payload) });
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 502 && isRecord(error.details)) {
+        return response.status(error.status).json({
+          success: false,
+          ...error.details,
+          error: { code: error.code, message: error.message },
+        });
+      }
+      throw error;
+    }
+  };
   const app = express();
   app.disable("x-powered-by");
   app.enable("strict routing");
@@ -96,7 +135,7 @@ export function createApplication(options: ApplicationOptions): Application {
   if (waha instanceof WahaPlatformAdapter) {
     app.post("/webhooks/waha", async (request, response) => {
       const body = await waha.readWebhook(request, webhookToken("waha"));
-      response.json({ success: true, ...await service.receiveInbound("waha", body) });
+      return respondToInbound("waha", body, response);
     });
   }
 
@@ -108,13 +147,13 @@ export function createApplication(options: ApplicationOptions): Application {
   app.use(rawBody);
   app.post("/tasks", async (request, response) => {
     const body = await readObject(request);
-    exactKeys(body, ["hermesSessionId", "platform", "conversationId", "title"]);
+    exactKeys(body, ["hermesSessionId", "platform", "conversationId", "description"]);
     const platform = platforms.get(requiredString(body.platform, "platform", 100));
     const task = service.createTask({
       hermesSessionId: requiredString(body.hermesSessionId, "hermesSessionId", 200),
       platform: platform.platform,
       conversationId: validateConversationId(body.conversationId, platform.platform),
-      title: requiredString(body.title, "title", 300),
+      description: requiredDescription(body.description),
     });
     return response.status(201).json({ success: true, task });
   });
@@ -145,12 +184,44 @@ export function createApplication(options: ApplicationOptions): Application {
     return response.json({ success: true, task: service.getTask(taskId) });
   });
 
-  app.post("/tasks/:taskId/send", async (request, response) => {
+  app.post("/tasks/selection", async (request, response) => {
+    const body = await readObject(request);
+    exactKeys(body, ["webhookMessage", "platform", "conversationId", "taskIds"]);
+    const platform = platforms.get(requiredString(body.platform, "platform", 100));
+    const conversationId = validateConversationId(body.conversationId, platform.platform);
+    if (!Array.isArray(body.taskIds) || body.taskIds.length === 0 ||
+        body.taskIds.some(id => typeof id !== "string" || !id.trim() || id.length > 200) ||
+        new Set(body.taskIds).size !== body.taskIds.length) {
+      throw invalidRequest('"taskIds" must be a non-empty array of unique task IDs.');
+    }
+    const result = await service.selectTasks({
+      webhookMessage: requiredString(body.webhookMessage, "webhookMessage"),
+      platform: platform.platform,
+      conversationId,
+      taskIds: body.taskIds as string[],
+    });
+    return response.status(result.failed ? 502 : 200).json({
+      success: !result.failed,
+      eventId: result.eventId,
+      taskIds: result.taskIds,
+      routingOutcome: result.routingOutcome,
+      deliveries: result.deliveries,
+      ...(result.failed ? { error: { code: "HERMES_DELIVERY_FAILED", message: "One or more Hermes deliveries failed." } } : {}),
+    });
+  });
+
+  app.post("/tasks/:taskId", async (request, response) => {
     const taskId = request.params.taskId as string;
     const body = await readObject(request);
-    exactKeys(body, ["message"]);
-    const task = await service.sendMessage(taskId, requiredString(body.message, "message"));
-    return response.json({ success: true, taskId, status: task.status });
+    exactKeys(body, ["platform", "conversationId", "message", "description"]);
+    const platform = platforms.get(requiredString(body.platform, "platform", 100));
+    const task = await service.sendMessage(taskId, {
+      platform: platform.platform,
+      conversationId: validateConversationId(body.conversationId, platform.platform),
+      message: requiredString(body.message, "message"),
+      description: requiredDescription(body.description),
+    });
+    return response.json({ success: true, taskId, status: task.status, description: task.description });
   });
 
   app.post("/tasks/:taskId/complete", async (request, response) => {
@@ -220,8 +291,7 @@ export function createApplication(options: ApplicationOptions): Application {
       const externalMessageId = body.externalMessageId === undefined
         ? `stub_${crypto.randomUUID()}`
         : requiredString(body.externalMessageId, "externalMessageId", 300);
-      const outcome = await service.receiveInbound("stub", { conversationId, externalMessageId, message });
-      return response.json({ success: true, ...outcome });
+      return respondToInbound("stub", { conversationId, externalMessageId, message }, response);
     });
 
     app.post("/webhooks/stub", async (request, response) => {
@@ -230,8 +300,7 @@ export function createApplication(options: ApplicationOptions): Application {
       validatePhoneNumber(body.conversationId);
       requiredString(body.externalMessageId, "externalMessageId", 300);
       requiredString(body.message, "message");
-      const outcome = await service.receiveInbound("stub", body);
-      return response.json({ success: true, ...outcome });
+      return respondToInbound("stub", body, response);
     });
   }
 
@@ -255,7 +324,14 @@ export function createApplication(options: ApplicationOptions): Application {
     });
   };
   app.use(handleError);
-  return { app, service, store, platforms, hermes };
+  return { app, service, store, platforms, hermes, classifier };
+}
+
+function requiredDescription(value: unknown): string {
+  if (typeof value !== "string" || value.trim().length === 0 || value.length > 20_000) {
+    throw invalidRequest('"description" must be a non-empty string of at most 20000 characters.');
+  }
+  return value;
 }
 
 function authorize(request: Request, token: string, webhook: boolean): void {

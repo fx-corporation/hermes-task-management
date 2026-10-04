@@ -9,6 +9,53 @@ Repository-wide instructions are in [AGENTS.md](AGENTS.md).
 
 ## Unreleased
 
+### 2026-10-04 — Route concurrent tasks with local Ollama classification
+
+- **Agent:** Codex
+- **Changes:** Updated `src/task-tracker/domain.ts`,
+  `src/task-tracker/store.ts`, `src/task-tracker/app.ts`,
+  `src/task-tracker/task-service.ts`, and
+  `src/task-tracker/http-hermes-adapter.ts` to store task descriptions, allow
+  multiple open tasks per platform/contact, replace the send route, and return
+  plural task IDs with routing outcomes. Added
+  `src/task-tracker/task-classifier.ts` for independent confidence scores,
+  owner review sessions, and selection prompts. Updated
+  `src/hermes-stub/server.ts` and `src/hermes-stub/frontend/App.tsx` for empty
+  sessions, `{ "input": "..." }` chat turns, score fixtures, descriptions, and
+  the new send contract. Updated `src/task-tracker/server.ts`,
+  `docker-compose.yaml`, and `README.md`.
+  Added routing coverage in `test/task-routing.test.ts` and updated
+  `test/api.test.ts`, `test/platform-routing.test.ts`, `test/hermes.test.ts`,
+  `test/hermes-stub.test.ts`, `test/hermes-ui.test.ts`,
+  `test/hermes-react.test.ts`, and `test/waha.test.ts`.
+  Added the `ollama/ollama:rocm` service, AMD GPU device access, persistent
+  model storage, and classifier endpoint/model settings to
+  `docker-compose.yaml`. Updated `src/task-tracker/task-classifier.ts` and
+  `src/task-tracker/app.ts` to use a separate OpenAI-compatible
+  chat-completions URL and API key for scoring while keeping owner review on
+  Hermes. Added `docker.compose.amd-hx-370.yaml` with the device access, HSA
+  settings, port, volume, and container configuration needed to run Ollama on
+  a Ryzen AI 9 HX 370 integrated GPU. Updated `src/task-tracker/task-classifier.ts`
+  to log classifier errors with routing context and the safe owner-review
+  fallback, with corresponding failure coverage in `test/task-routing.test.ts`.
+  Updated `src/hermes-stub/events.ts` to retain complete inbound task-tracker
+  envelopes for the UI while extracting task and sender metadata, with coverage
+  in `test/hermes-ui.test.ts`. Documented Ollama setup and classifier
+  configuration in `README.md`.
+- **Why:** Support concurrent task context for one contact, classify ambiguous
+  replies locally on AMD ROCm hardware, route uncertainty to owner review, make
+  classifier failures diagnosable, and show the exact session-chat input in the
+  Hermes stub UI.
+- **Validation:** `bun run typecheck`, `bun run test` (43 tests), `bun run
+  build`, `bun run build:hermes-ui`, `bun test test/task-routing.test.ts` (8
+  tests), and `bun test test/hermes-ui.test.ts` (1 test) passed. `docker compose
+  -f docker-compose.yaml -f docker.compose.amd-hx-370.yaml config` passed and
+  resolved the expected ROCm image, devices, environment variables, port,
+  volume, and container name. `git diff --check` and a trailing-whitespace scan
+  of the new files passed. The initial Ollama integration step was not tested
+  separately when introduced; the later combined checks cover the resulting
+  code and configuration as described above.
+
 ### 2026-09-28 — Use slim Bun image for task-tracker runtime
 
 - **Agent:** Codex

@@ -35,10 +35,10 @@ test("React console creates tasks, sends, completes, cancels, and safely renders
         tasks.push(task); return Response.json({ task });
       }
       const task = tasks.find(t => path.includes(t.id))!;
-      if (path.endsWith("/send")) task.status = "WAITING_EXTERNAL_REPLY";
+      if (/\/tasks\/[^/]+$/.test(path)) { task.status = "WAITING_EXTERNAL_REPLY"; task.description = body.description; }
       if (path.endsWith("/complete")) { task.status = "COMPLETED"; task.result = body.result; }
       if (path.endsWith("/cancel")) { task.status = "CANCELLED"; task.cancelReason = body.reason; }
-      return Response.json({ status: task.status });
+      return Response.json({ status: task.status, description: task.description });
     }
     if (path.startsWith("/api/tracker/conversations?")) return Response.json({ conversations: [{ platform: "waha", conversationId: "12025550101@lid", displayName: "Dental" }] });
     if (path === "/api/tracker/tasks") return Response.json({ tasks });
@@ -50,13 +50,14 @@ test("React console creates tasks, sends, completes, cancels, and safely renders
     await waitFor(() => expect(view.getByRole("option", { name: "Dental (12025550101@lid)" })).toBeDefined());
     await waitFor(() => expect(view.getByText("<script>bad()</script> Confirmed")).toBeDefined());
     expect(view.container.querySelector("script")).toBeNull();
-    fireEvent.change(view.getByLabelText("Task title"), { target: { value: "Book dentist" } });
+    fireEvent.change(view.getByLabelText("Task description"), { target: { value: "Book dentist; ask about availability and record latest state." } });
     fireEvent.click(view.getByRole("button", { name: "Create task" }));
     await waitFor(() => expect(view.getByLabelText("Message")).toBeDefined());
+    fireEvent.change(view.getByLabelText("Current task description"), { target: { value: "Book dentist; asked about Tuesday availability." } });
     fireEvent.change(view.getByLabelText("Message"), { target: { value: "Available?" } });
     fireEvent.click(view.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(view.getByText("WAITING_EXTERNAL_REPLY · 12025550101@lid")).toBeDefined());
-    expect(mutations.find(m => m.path.endsWith("/send"))?.body.message).toBe("Available?");
+    expect(mutations.find(m => /\/tasks\/[^/]+$/.test(m.path))?.body).toMatchObject({ message: "Available?", platform: "waha", conversationId: "12025550101@lid", description: "Book dentist; asked about Tuesday availability." });
     await act(async () => {
       activeSource!.dispatchEvent(new dom.MessageEvent("message", { data: JSON.stringify({ id: "live-reply", taskId: "task-0", sessionId: mutations[0]!.body.hermesSessionId, sender: "Dental", message: "Live callback reply", direction: "received", timestamp: new Date().toISOString() }) }));
     });
@@ -66,7 +67,7 @@ test("React console creates tasks, sends, completes, cancels, and safely renders
     fireEvent.click(view.getByRole("button", { name: "Complete task" }));
     await waitFor(() => expect(view.getByText("Result: Booked")).toBeDefined());
     expect(view.queryByRole("button", { name: "Send message" })).toBeNull();
-    fireEvent.change(view.getByLabelText("Task title"), { target: { value: "Second task" } });
+    fireEvent.change(view.getByLabelText("Task description"), { target: { value: "Follow up about a second appointment." } });
     fireEvent.click(view.getByRole("button", { name: "Create task" }));
     await waitFor(() => expect(view.getByLabelText("Cancellation reason (optional)")).toBeDefined());
     fireEvent.change(view.getByLabelText("Cancellation reason (optional)"), { target: { value: "Changed plans" } });

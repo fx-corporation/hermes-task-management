@@ -34,22 +34,22 @@ test("routes identical contacts and message IDs independently across registered 
     const tasks = [];
     for (const platform of ["stub", "waha"]) {
       const session = platform === "stub" ? "stub/session?one" : "waha-session";
-      const task = (await call("/tasks", { platform, conversationId: platform === "waha" ? "12025550101@lid" : contact, hermesSessionId: session, title: platform })).body.task;
+      const task = (await call("/tasks", { platform, conversationId: platform === "waha" ? "12025550101@lid" : contact, hermesSessionId: session, description: platform })).body.task;
       tasks.push(task);
-      expect((await call(`/tasks/${task.id}/send`, { message: `Hello ${platform}` })).status).toBe(200);
+      expect((await call(`/tasks/${task.id}`, { platform, conversationId: task.conversationId, message: `Hello ${platform}`, description: `Latest ${platform} state` })).status).toBe(200);
     }
     expect(sends).toHaveLength(1);
     const stubReply = { conversationId: contact, externalMessageId: "shared-id", message: "Stub reply" };
     const wahaReply = { event: "message", session: "default", payload: { id: "shared-id", from: "12025550101@lid", fromMe: false, body: "WAHA reply", timestamp: 1750000000 } };
     expect((await call("/webhooks/stub", stubReply, "waha-hook")).status).toBe(401);
     expect((await call("/webhooks/waha", wahaReply, "stub-hook")).status).toBe(401);
-    expect((await call("/webhooks/stub", stubReply, "stub-hook")).body.taskId).toBe(tasks[0].id);
-    expect((await call("/webhooks/waha", wahaReply, "waha-hook")).body.taskId).toBe(tasks[1].id);
+    expect((await call("/webhooks/stub", stubReply, "stub-hook")).body.taskIds).toEqual([tasks[0].id]);
+    expect((await call("/webhooks/waha", wahaReply, "waha-hook")).body.taskIds).toEqual([tasks[1].id]);
     expect((await call("/webhooks/waha", wahaReply, "waha-hook")).body.duplicate).toBe(true);
     expect(logs).toHaveLength(2);
     expect(logs.map(r => new URL(r.url as string).pathname)).toEqual(["/api/sessions/stub%2Fsession%3Fone/chat", "/api/sessions/waha-session/chat"]);
-    expect(JSON.parse(logs[0]!.body as string).message).toContain("Stub reply");
-    expect(JSON.parse(logs[1]!.body as string).message).toContain("WAHA reply");
+    expect(JSON.parse(logs[0]!.body as string).input).toContain("Stub reply");
+    expect(JSON.parse(logs[1]!.body as string).input).toContain("WAHA reply");
     for (const platform of ["stub", "waha"]) {
       expect((await call(`/tasks?platform=${platform}`)).body.tasks).toHaveLength(1);
       const actions = (await call(`/conversations/${platform === "waha" ? "12025550101%40lid" : "%2B12025550101"}/actions?platform=${platform}`)).body.actions;

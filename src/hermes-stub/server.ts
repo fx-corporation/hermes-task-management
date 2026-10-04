@@ -9,6 +9,7 @@ export function startHermesStub(options: {
   uiDir?: string;
   taskTrackerUrl?: string;
   taskTrackerToken?: string;
+  scoringFixtures?: unknown[];
   log?: (request: Record<string, unknown>) => void;
 } = {}) {
   const uiDir = resolve(options.uiDir ?? process.env.HERMES_STUB_UI_DIR ?? "dist/hermes-stub/ui");
@@ -44,6 +45,7 @@ export function startHermesStub(options: {
     }
   };
   const chats = new Map<string, { body: string; completion: object }>();
+  const scoringFixtures = [...(options.scoringFixtures ?? scoringFixturesFromEnvironment())];
   const log = options.log ?? (request => console.log("Hermes stub request", request));
   return Bun.serve({
     hostname: options.hostname ?? "127.0.0.1",
@@ -92,7 +94,7 @@ export function startHermesStub(options: {
         const target = path.slice("/api/tracker".length);
         const allowed = request.method === "GET"
           ? /^\/(tasks|conversations)$/.test(target)
-          : request.method === "POST" && (target === "/tasks" || /^\/tasks\/[^/]+\/(send|complete|cancel)$/.test(target));
+          : request.method === "POST" && (target === "/tasks" || target === "/tasks/selection" || /^\/tasks\/[^/]+(\/(complete|cancel))?$/.test(target));
         if (!allowed) return Response.json({ error: "Not found" }, { status: 404 });
         const response = await proxy(target + url.search, request, body);
         if (response.ok) {
@@ -100,10 +102,15 @@ export function startHermesStub(options: {
           if (target === "/tasks") {
             for (const task of result.tasks ?? (result.task ? [result.task] : [])) tasks.set(task.id, task);
           }
-          const send = target.match(/^\/tasks\/([^/]+)\/send$/);
+          const send = target.match(/^\/tasks\/([^/]+)$/);
           if (send) {
             const task = tasks.get(decodeURIComponent(send[1]!));
-            if (task) broadcast({ id: crypto.randomUUID(), sessionId: task.hermesSessionId, taskId: task.id, sender: "You", message: JSON.parse(body).message, timestamp: new Date().toISOString(), direction: "sent" });
+            const result = await response.clone().json() as { status?: string; description?: string };
+            if (task) {
+              if (typeof result.status === "string") task.status = result.status as MessagingTask["status"];
+              if (typeof result.description === "string") task.description = result.description;
+              broadcast({ id: crypto.randomUUID(), sessionId: task.hermesSessionId, taskId: task.id, sender: "You", message: JSON.parse(body).message, timestamp: new Date().toISOString(), direction: "sent" });
+            }
           }
         }
         return response;
@@ -116,6 +123,28 @@ export function startHermesStub(options: {
       if (request.method === "GET" && path === "/health") {
         return Response.json({ status: "ok", service: "hermes-stub" });
       }
+      if (request.method === "POST" && path === "/api/sessions") {
+        const sessionId = `stub-owner-${crypto.randomUUID()}`;
+        return Response.json({ id: sessionId }, { status: 201 });
+      }
+      if (request.method === "POST" && path === "/v1/chat/completions") {
+        let payload: unknown;
+        try { payload = JSON.parse(body); } catch { return Response.json({ error: "Invalid JSON" }, { status: 400 }); }
+        const messages = payload && typeof payload === "object" && "messages" in payload && Array.isArray(payload.messages)
+          ? payload.messages as { role?: unknown; content?: unknown }[]
+          : [];
+        const userContent = messages.find(message => message.role === "user")?.content;
+        let candidates: { taskId: string }[] = [];
+        if (typeof userContent === "string") {
+          try {
+            const input = JSON.parse(userContent) as { candidates?: unknown };
+            if (Array.isArray(input.candidates)) candidates = input.candidates.filter((item): item is { taskId: string } =>
+              !!item && typeof item === "object" && "taskId" in item && typeof item.taskId === "string");
+          } catch { /* Malformed model input receives the configured/default fixture. */ }
+        }
+        const fixture = scoringFixtures.shift() ?? { scores: candidates.map(candidate => ({ taskId: candidate.taskId, confidence: 0.5 })) };
+        return Response.json({ choices: [{ message: { role: "assistant", content: JSON.stringify(fixture) } }] });
+      }
       const chat = path.match(/^\/api\/sessions\/([^/]+)\/chat$/);
       if (request.method !== "POST" || !chat) {
         return Response.json({ error: "Not found" }, { status: 404 });
@@ -125,8 +154,8 @@ export function startHermesStub(options: {
         return Response.json({ error: "Invalid JSON" }, { status: 400 });
       }
       if (!payload || typeof payload !== "object" ||
-          !("message" in payload) || typeof payload.message !== "string" || !payload.message.trim()) {
-        return Response.json({ error: "message is a required string" }, { status: 400 });
+          !("input" in payload) || typeof payload.input !== "string" || !payload.input.trim()) {
+        return Response.json({ error: "input is a required string" }, { status: 400 });
       }
       const sessionId = decodeURIComponent(chat[1]!);
       const requestKey = request.headers.get("idempotency-key");
@@ -141,7 +170,7 @@ export function startHermesStub(options: {
         message: { role: "assistant", content: "Reply received by Hermes development stub." },
         usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
       };
-      if (!previous) broadcast(receivedMessage(sessionId, payload.message));
+      if (!previous) broadcast(receivedMessage(sessionId, payload.input));
       if (key && !previous) chats.set(key, { body, completion });
       return Response.json(completion, {
         status: 200,
@@ -149,6 +178,16 @@ export function startHermesStub(options: {
       });
     },
   });
+}
+
+function scoringFixturesFromEnvironment(): unknown[] {
+  const configured = process.env.HERMES_STUB_SCORING_FIXTURES;
+  if (!configured) return [];
+  let fixtures: unknown;
+  try { fixtures = JSON.parse(configured) as unknown; }
+  catch { throw new Error("HERMES_STUB_SCORING_FIXTURES must be a JSON array."); }
+  if (!Array.isArray(fixtures)) throw new Error("HERMES_STUB_SCORING_FIXTURES must be a JSON array.");
+  return fixtures;
 }
 
 if (import.meta.main) {

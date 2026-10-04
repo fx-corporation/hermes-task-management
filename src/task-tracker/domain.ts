@@ -16,7 +16,7 @@ export interface Conversation {
 
 export interface MessagingTask {
   id: string;
-  title: string;
+  description: string;
   platform: Platform;
   conversationId: string;
   hermesSessionId: string;
@@ -32,10 +32,21 @@ export type ActionType = "MESSAGE_SENT" | "WEBHOOK_RECEIVED" | "HERMES_DELIVERED
 
 export type EventOutcome =
   | "PENDING_HERMES"
+  | "PENDING_OWNER_SELECTION"
   | "DELIVERED"
   | "IGNORED_NO_ACTIVE_TASK"
   | "IGNORED_TASK_CLOSED"
-  | "DELIVERY_FAILED";
+  | "DELIVERY_FAILED"
+  | "OWNER_REVIEW_FAILED";
+
+export type RoutingOutcome =
+  | "AUTO_ROUTED"
+  | "OWNER_REVIEW"
+  | "MANUAL_SELECTION"
+  | "IGNORED_NO_ACTIVE_TASK"
+  | "IGNORED_TASK_CLOSED"
+  | "DELIVERY_FAILED"
+  | "OWNER_REVIEW_FAILED";
 
 export interface ConversationAction {
   id: string;
@@ -45,6 +56,7 @@ export interface ConversationAction {
   platform: Platform;
   conversationId: string;
   taskId?: string;
+  taskIds?: string[];
   hermesSessionId?: string;
   externalMessageId?: string;
   message: string;
@@ -66,9 +78,11 @@ export interface InboundEvent {
   id: string;
   deduplicationKey: string;
   message: InboundMessage;
-  taskId: string | null;
+  taskIds: string[];
   actionId: string;
   outcome: EventOutcome;
+  routingOutcome: RoutingOutcome;
+  ownerSessionId?: string;
 }
 
 export interface HermesDelivery {

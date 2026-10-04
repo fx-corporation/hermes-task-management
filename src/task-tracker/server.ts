@@ -3,6 +3,7 @@ import { StubPlatformAdapter } from "./adapters.ts";
 import { InMemoryStore } from "./store.ts";
 import { WahaPlatformAdapter } from "./waha-adapter.ts";
 import { createApplication } from "./app.ts";
+import { taskClassifierFromEnvironment } from "./task-classifier.ts";
 
 export function startServer(environment: NodeJS.ProcessEnv = process.env) {
   const apiToken = environment.MESSAGING_TASK_API_TOKEN;
@@ -24,7 +25,7 @@ export function startServer(environment: NodeJS.ProcessEnv = process.env) {
   const app = createApplication({ apiToken, webhookToken: "", store,
     platforms: [new StubPlatformAdapter(store), waha], defaultPlatform,
     webhookTokens: { stub: environment.STUB_WEBHOOK_TOKEN ?? "", waha: environment.WAHA_WEBHOOK_TOKEN ?? "" },
-    hermes: hermesFromEnvironment(environment) });
+    hermes: hermesFromEnvironment(environment), taskClassifier: taskClassifierFromEnvironment(environment, store) });
   const server = app.app.listen(parsedPort, environment.HOST ?? "127.0.0.1");
   return { server, app };
 }

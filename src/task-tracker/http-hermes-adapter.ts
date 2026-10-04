@@ -39,7 +39,7 @@ export class HttpHermesAdapter implements HermesDeliveryAdapter {
     ])).digest("hex");
     // Keep the body and key identical across retries, including ambiguous timeouts.
     const endpoint = `${this.endpoint}${encodeURIComponent(delivery.sessionId)}/chat`;
-    const body = JSON.stringify({ message: delivery.envelope });
+    const body = JSON.stringify({ input: delivery.envelope });
     for (let attempt = 0; ; attempt++) {
       let retryable = true;
       try {

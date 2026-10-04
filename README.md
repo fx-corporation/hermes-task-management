@@ -1,6 +1,6 @@
 # Hermes Task Management API
 
-A small Express 5 API written in TypeScript for managing one delegated messaging task per contact. The server runs on Bun with Express routing and middleware, an in-memory task registry, a registry containing both stub and WAHA messaging adapters, and an HTTP Hermes session receiver. Stub tasks send no external messages; WAHA tasks send real WhatsApp messages.
+A small Express 5 API written in TypeScript for managing multiple delegated messaging tasks per platform/contact pair. The server runs on Bun with Express routing and middleware, an in-memory task registry, a registry containing both stub and WAHA messaging adapters, Ollama classification, and HTTP Hermes delivery. Each task has a Hermes-maintained description with its context and latest state. Stub tasks send no external messages; WAHA tasks send real WhatsApp messages.
 
 ## Requirements and start
 
@@ -19,6 +19,8 @@ Run `bun run dev:hermes-stub` in a separate terminal before starting the app. Th
 
 The stub logs every request (method, URL, headers, and complete body), including health checks, rejected requests, and retries. Session chat requests receive HTTP 200 with a simulated assistant response. The development stub caches repeated idempotency keys per session. It performs no agent reasoning and stores idempotency records only in memory.
 
+For multiple open tasks on one contact, the task tracker scores candidates through the OpenAI-compatible chat-completions API. Compose connects this classifier to the local Ollama ROCm service with `TASK_CLASSIFIER_MODEL` defaulting to `gemma4:e4b`; pull the model once after starting Compose. `TASK_CLASSIFIER_THRESHOLD` defaults to `0.80`. A single confident match receives the reply directly; multiple matches, no confident match, or a model error starts an owner review session in Hermes.
+
 The server listens on `http://127.0.0.1:9005`. Set `PORT` to change the port. Bun's `--watch` mode restarts the server during development. Run `bun run build` to bundle the Express server into `dist/server.js`, then `bun dist/server.js` to run the bundle. Run `bun run typecheck` and `bun run test` to check the implementation.
 
 `GET /health` is public. Every other endpoint uses `Authorization: Bearer …`; task, contact, and simulation endpoints require `MESSAGING_TASK_API_TOKEN`, and `POST /webhooks/stub` requires the separate `STUB_WEBHOOK_TOKEN`.
@@ -34,15 +36,15 @@ AUTH="Authorization: Bearer $MESSAGING_TASK_API_TOKEN"
 # Find a contact.
 curl -H "$AUTH" "$API/conversations?platform=stub&search=dental"
 
-# Create a task with the existing Hermes session to receive replies.
+# Create a task with its context and latest state.
 curl -X POST -H "$AUTH" -H 'Content-Type: application/json' \
-  -d '{"hermesSessionId":"session_demo_1","platform":"stub","conversationId":"+12025550101","title":"Book a dental appointment"}' \
+  -d '{"hermesSessionId":"session_demo_1","platform":"stub","conversationId":"+12025550101","description":"Arrange a dental appointment. Latest state: no date confirmed."}' \
   "$API/tasks"
 
-# Use the returned task ID to send a message. The destination comes from that task.
+# Use the returned task ID to send a message and replace the latest task description.
 curl -X POST -H "$AUTH" -H 'Content-Type: application/json' \
-  -d '{"message":"Do you have an appointment Tuesday at 3:30 PM?"}' \
-  "$API/tasks/TASK_ID/send"
+  -d '{"platform":"stub","conversationId":"+12025550101","message":"Do you have an appointment Tuesday at 3:30 PM?","description":"Arrange a dental appointment. Latest state: asked about Tuesday at 3:30 PM."}' \
+  "$API/tasks/TASK_ID"
 
 # Simulate an external contact reply; externalMessageId is generated when omitted.
 curl -X POST -H "$AUTH" -H 'Content-Type: application/json' \
@@ -67,13 +69,22 @@ curl -X POST -H "Authorization: Bearer $STUB_WEBHOOK_TOKEN" \
   "$API/webhooks/stub"
 ```
 
+When Hermes asks the owner to choose task targets, it calls the tracker with the supplied reply and selected IDs:
+
+```sh
+curl -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"webhookMessage":"Tuesday at 3 PM is available.","platform":"stub","conversationId":"+12025550101","taskIds":["TASK_ID_1","TASK_ID_2"]}' \
+  "$API/tasks/selection"
+```
+
 ## Endpoints
 
 - `GET /conversations?platform=stub&search=...` lists contacts by name or number.
 - `POST /stub/conversations` accepts `{ "conversationId": "+12025550103", "displayName": "Example Contact" }` to add a contact.
-- `POST /tasks` accepts `hermesSessionId`, `platform`, `conversationId`, and `title`.
+- `POST /tasks` accepts `hermesSessionId`, `platform`, `conversationId`, and a required `description` of up to 20,000 characters. Multiple open tasks can use the same platform/contact pair.
 - `GET /tasks` supports `status`, `platform`, `conversationId`, and `hermesSessionId` filters; `GET /tasks/{taskId}` gets one task.
-- `POST /tasks/{taskId}/send` accepts only `{ "message": "..." }`.
+- `POST /tasks/{taskId}` accepts `platform`, `conversationId`, `message`, and `description`; it verifies the destination, stores the replacement description, and sends the message.
+- `POST /tasks/selection` accepts `webhookMessage`, `platform`, `conversationId`, and a non-empty array of unique `taskIds`. It validates every selected task before delivering to any of them and reports an outcome for each delivery. The owner-review session uses this endpoint as its callback.
 - `POST /tasks/{taskId}/complete` accepts `{ "result": "..." }`; `POST /tasks/{taskId}/cancel` accepts an optional `{ "reason": "..." }`.
 - `POST /stub/conversations/{conversationId}/reply` accepts `{ "message": "...", "externalMessageId": "optional-id" }`.
 - `POST /webhooks/stub` accepts `{ "conversationId": "...", "externalMessageId": "...", "message": "..." }`.
@@ -81,7 +92,7 @@ curl -X POST -H "Authorization: Bearer $STUB_WEBHOOK_TOKEN" \
 
 Request bodies are limited to 1 MB; compressed request bodies are unsupported so WAHA signatures are checked against the exact received bytes.
 
-Responses use `{ "success": true, ... }`; failures use `{ "success": false, "error": { "code": "...", "message": "..." } }`. Task statuses are `ACTIVE`, `WAITING_EXTERNAL_REPLY`, `COMPLETED`, and `CANCELLED`. Only one open task can own a platform/contact pair. A delivered external reply changes a waiting task back to `ACTIVE`; closed tasks do not receive later replies. Repeated webhook IDs return the original event outcome without duplicating actions or delivery.
+Responses use `{ "success": true, ... }`; failures use `{ "success": false, "error": { "code": "...", "message": "..." } }`. Task statuses are `ACTIVE`, `WAITING_EXTERNAL_REPLY`, `COMPLETED`, and `CANCELLED`. Both `ACTIVE` and `WAITING_EXTERNAL_REPLY` tasks are reply-routing candidates. A delivered external reply changes a waiting task back to `ACTIVE`; closing one task leaves the others open. Webhook responses include `taskIds` and `routingOutcome`, plus `ownerSessionId` when Hermes asks the owner to choose. Repeated provider webhook IDs return the original outcome without repeating classification, owner prompting, or delivery.
 
 ## V1 boundary
 
@@ -100,7 +111,7 @@ curl http://127.0.0.1:9005/health
 
 Compose builds the stub from [its Dockerfile](src/hermes-stub/Dockerfile), waits for its health check, and connects the task tracker to `http://hermes-stub:8643` by default. View all stub requests with `docker compose logs -f hermes-stub`. Set `HERMES_BASE_URL` and `HERMES_API_KEY` in the root `.env` to target a real Hermes gateway instead.
 
-Run `docker compose up -d --build` to start the app, Hermes stub, and existing WAHA service. WAHA uses its own `.waha/.env` configuration. The app defaults to stub mode. To connect it to WAHA, use the configuration below. Container restarts discard its in-memory state.
+Run `docker compose up -d --build` to start the app, Hermes stub, WAHA, and Ollama ROCm. Pull the configured classifier model once with `docker compose exec ollama ollama pull gemma4:e4b`; if you change `TASK_CLASSIFIER_MODEL`, pull that model instead. WAHA uses its own `.waha/.env` configuration. The app defaults to stub mode. To connect it to WAHA, use the configuration below. Container restarts discard its in-memory state.
 
 Inside Docker, the app listens on `0.0.0.0:9005`; Compose publishes it on host port 9005. The Hermes stub is published on loopback port 8643. For local startup, `HOST` can override the default `127.0.0.1` bind address.
 
@@ -152,7 +163,13 @@ docker compose logs -f task-tracker
 
 Enable the [Hermes API server](https://hermes-agent.nousresearch.com/docs/user-guide/features/api-server) and set `HERMES_API_KEY` to its `API_SERVER_KEY`. `HttpHermesAdapter` sends authenticated HTTP requests to the session-chat endpoint. `HERMES_BASE_URL` defaults to the local stub at `http://127.0.0.1:8643`; set it to `http://127.0.0.1:8642` for a local real Hermes gateway. In Docker, use `http://host.docker.internal:8642` for a host gateway reachable from the container. Compose sets it to `http://hermes-stub:8643` for the standalone stub. Server startup requires the key.
 
-Replies are normalized by their receiving platform adapter. The tracker finds the open task by `(platform, conversationId)`, reads its `hermesSessionId`, and sends `POST /api/sessions/{id}/chat` with `{ "message": "<untrusted-content envelope>" }`. The ID is URL-encoded. Use an existing Hermes session; unknown sessions fail with HTTP 404. Session chat runs a synchronous agent turn using existing history. `DELIVERED` and `HERMES_DELIVERED` are recorded after a valid session chat completion, not after creating an asynchronous run.
+Replies are normalized by their receiving platform adapter. For one open task, the tracker sends the reply directly to that task's `hermesSessionId` through `POST /api/sessions/{id}/chat` with `{ "input": "<untrusted-content envelope>" }`. The ID is URL-encoded. Use an existing Hermes session; unknown sessions fail with HTTP 404. Session chat runs a synchronous agent turn using existing history. `DELIVERED` and `HERMES_DELIVERED` are recorded after a valid session chat completion, not after creating an asynchronous run.
+
+When multiple tasks are open for the platform/contact pair, the tracker calls the classifier's OpenAI-compatible `POST /v1/chat/completions` endpoint with the webhook text and each task ID and description. Compose sets `TASK_CLASSIFIER_BASE_URL` to `http://ollama:11434/v1`, `TASK_CLASSIFIER_API_KEY` to Ollama's ignored local API key value, and `TASK_CLASSIFIER_MODEL` to `gemma4:e4b` by default. The classifier returns one independent confidence score per task. Scores at or above the configured threshold are matches: one match is delivered directly; multiple matches go to owner review. If no score meets the threshold or scoring fails, all open task IDs go to owner review. The task context and external text are provided separately from the classifier instructions and are treated as untrusted data.
+
+Owner review creates an empty Hermes session using `POST /api/sessions`, then sends a prompt using `{ "input": "..." }` to that session's chat endpoint. The prompt includes the contact, webhook text, candidate descriptions, and exact JSON callback body for `POST /tasks/selection`. Configure `TASK_TRACKER_BASE_URL` so it resolves from Hermes; Compose sets it to `http://task-tracker:9005`. The tracker bearer token must be available to Hermes through its environment and is never included in the prompt. `TASK_CLASSIFIER_MODEL` defaults to `gemma4:e4b` in Compose, and `TASK_CLASSIFIER_THRESHOLD` defaults to `0.80` and accepts values from 0 to 1.
+
+The selection callback bypasses classification and delivers the supplied reply to every selected open task for that platform/contact, in per-session order. It attempts every delivery and returns individual outcomes; HTTP 502 indicates one or more failed deliveries while retaining successful delivery records. Each callback request gets a new generated message ID. Repeated callbacks can deliver again because there is no idempotency header or event ID that can identify a particular original webhook record.
 
 `HERMES_MAX_RETRIES` is a non-negative integer, default `3`: one initial attempt plus up to three retries. Set `0` to disable retries. Network errors, request timeouts, HTTP 408/429, and HTTP 5xx are retried with delays of 1, 2, and 4 seconds by default. Other HTTP errors fail immediately. Set `HERMES_TIMEOUT_MS` to a positive integer (default `120000`) for each synchronous chat request. Every attempt uses the same idempotency key and payload; the development stub deduplicates it, but native Hermes session chat does not document the Runs API idempotency guarantee. A retry after an ambiguous failure or timeout may repeat the agent turn. Exhausted deliveries return HTTP 502 and record `DELIVERY_FAILED`; the task remains waiting. Duplicate webhooks retain the recorded outcome and do not start a fresh retry cycle. There is no persistent background retry queue.
 
@@ -164,7 +181,7 @@ Replies are normalized by their receiving platform adapter. The tracker finds th
 
 Open `http://localhost:8643` after `docker compose up -d --build`. Configure `WAHA_API_KEY` and webhook credentials in `.env`, then pair the WAHA session. Point its webhook to `http://task-tracker:9005/webhooks/waha`. The task tracker finds the task for that platform/contact and delivers the reply to the stub's `/api/sessions/{id}/chat` endpoint. This callback records the message and pushes it to the React UI over `/api/events/stream` (Server-Sent Events). The UI never fetches conversation history from the task tracker. The existing stub `/webhooks/waha` relay remains available, but reply display depends on the task tracker's callback, so only replies delivered to a bound Hermes session appear.
 
-Choose WhatsApp, refresh contacts, enter a title and session ID, and create a task. Select a task to send a message through the task tracker and WAHA. Successful sends and callback replies form the conversation shown in the UI; callbacks also appear in the reply inbox. Tasks load once when the UI opens. Successful create/send/complete/cancel actions and live reply callbacks update task state locally. Use Refresh tasks to request a manual reload; there is no task-list polling. Complete with a result, or cancel with an optional reason. The local messaging stub supports the existing simulation API and delivers callbacks through the same path. Message snapshots on SSE connection/reconnection restore the stub's in-memory history; idempotent callbacks appear once.
+Choose WhatsApp, refresh contacts, enter a task description and Hermes session ID, and create a task. Edit the description as the task state changes. Select a task to send a message through the task tracker and WAHA. Successful sends and callback replies form the conversation shown in the UI; callbacks also appear in the reply inbox. Tasks load once when the UI opens. Successful create/send/complete/cancel actions and live reply callbacks update task state locally. Use Refresh tasks to request a manual reload; there is no task-list polling. Complete with a result, or cancel with an optional reason. The local messaging stub supports the task API, empty Hermes session creation, `{ "input": "..." }` session turns, and configurable score fixtures through `HERMES_STUB_SCORING_FIXTURES` (a JSON array of `{ "scores": [...] }` results). It remains a development simulator. Message snapshots on SSE connection/reconnection restore the stub's in-memory history; idempotent task reply callbacks appear once.
 
 
 For separate local processes, configure `TASK_TRACKER_BASE_URL` (default `http://127.0.0.1:9005`) and `MESSAGING_TASK_API_TOKEN` for the Hermes stub. Compose supplies the internal tracker URL and loads the token from `.env`. The token stays on the server. The UI is a local development console without its own login. Inbox and run state disappear on restart; a live paired WAHA session is required for real WhatsApp messages.
@@ -179,7 +196,7 @@ The Hermes stub UI uses React with TypeScript and Vite. Components and styles li
 
 ## Platform registration
 
-Both built-in adapters (`stub` and `waha`) are always registered. Choose `platform` on task creation, contact discovery, and action history. Sends use the task's platform; `/webhooks/stub` and `/webhooks/waha` normalize and route independently. Each platform/contact identifier can have one open task, bound to its own Hermes session. Message IDs and history are isolated by platform.
+Both built-in adapters (`stub` and `waha`) are always registered. Choose `platform` on task creation, contact discovery, and action history. Sends use the task's platform; `/webhooks/stub` and `/webhooks/waha` normalize and route independently. Each open task is bound to its own Hermes session; multiple open tasks can share a platform/contact. Message IDs and history are isolated by platform.
 
 `MESSAGING_PLATFORM` now only chooses the default for contact/history queries that omit `platform`; it does not disable other adapters. WAHA requires `WAHA_API_KEY` for discovery and sending; without it, those operations return `503 WAHA_NOT_CONFIGURED`. Configure `STUB_WEBHOOK_TOKEN` for stub webhooks and either `WAHA_WEBHOOK_TOKEN` or `WAHA_WEBHOOK_HMAC_KEY` for WAHA webhooks. Missing webhook credentials never authorize an empty bearer token. Programmatic applications can supply adapters through `platforms` and per-platform tokens through `webhookTokens`.
 

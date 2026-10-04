@@ -16,7 +16,7 @@ test("stub accepts adapter delivery and logs every request, including rejected a
     expect(logs).toHaveLength(2);
     expect(logs[0]!.method).toBe("POST");
     expect((logs[0]!.headers as Record<string, string>).authorization).toBe("Bearer development");
-    expect(JSON.parse(logs[0]!.body as string)).toEqual({ message: delivery.envelope });
+    expect(JSON.parse(logs[0]!.body as string)).toEqual({ input: delivery.envelope });
     expect(logs[1]!.body).toBe(logs[0]!.body);
     const headers = logs[0]!.headers as Record<string, string>;
     const replay = await fetch(new URL("api/sessions/session/chat", server.url), { method: "POST", headers, body: logs[0]!.body as string });
@@ -24,7 +24,7 @@ test("stub accepts adapter delivery and logs every request, including rejected a
     expect(replay.status).toBe(200);
     expect(replay.headers.get("idempotency-replayed")).toBe("true");
     expect((await replay.json()).session_id).toBe((await secondReplay.json()).session_id);
-    const conflict = await fetch(new URL("api/sessions/session/chat", server.url), { method: "POST", headers, body: JSON.stringify({ message: "different" }) });
+    const conflict = await fetch(new URL("api/sessions/session/chat", server.url), { method: "POST", headers, body: JSON.stringify({ input: "different" }) });
     expect(conflict.status).toBe(409);
     expect((await fetch(new URL("health", server.url))).status).toBe(200);
     expect((await fetch(new URL("missing", server.url), { method: "PUT", body: "debug body" })).status).toBe(404);

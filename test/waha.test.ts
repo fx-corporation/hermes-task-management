@@ -38,10 +38,10 @@ describe("WAHA adapter", () => {
     const contacts = await (await request("/conversations?platform=waha&search=dental")).json() as any;
     expect(contacts.conversations).toEqual([{ platform: "waha", conversationId: "12025550101@lid", displayName: "Dental" }]);
     expect(new Headers(calls[0]!.init!.headers).get("x-api-key")).toBe("secret");
-    const created = await request("/tasks", { platform: "waha", conversationId: "12025550101@lid", hermesSessionId: "hermes", title: "Book" });
+    const created = await request("/tasks", { platform: "waha", conversationId: "12025550101@lid", hermesSessionId: "hermes", description: "Book" });
     expect(created.status).toBe(201);
     const { task } = await created.json() as any;
-    expect((await request(`/tasks/${task.id}/send`, { message: "Available?" })).status).toBe(200);
+    expect((await request(`/tasks/${task.id}`, { platform: "waha", conversationId: task.conversationId, message: "Available?", description: "Asked about Tuesday availability." })).status).toBe(200);
     expect(JSON.parse(calls[1]!.init!.body as string)).toEqual({ session: "default", chatId: "12025550101@lid", text: "Available?" });
     const reply = await (await request("/webhooks/waha", event, "hook")).json() as any;
     expect(reply.outcome).toBe("DELIVERED");
@@ -88,8 +88,8 @@ describe("WAHA adapter", () => {
   test("provider send failure leaves the task active without recording a send", async () => {
     const { app, request } = setup(undefined, true);
     await request("/conversations?platform=waha");
-    const { task } = await (await request("/tasks", { platform: "waha", conversationId: "12025550101@lid", hermesSessionId: "hermes", title: "Book" })).json() as any;
-    const response = await request(`/tasks/${task.id}/send`, { message: "Hello" });
+    const { task } = await (await request("/tasks", { platform: "waha", conversationId: "12025550101@lid", hermesSessionId: "hermes", description: "Book" })).json() as any;
+    const response = await request(`/tasks/${task.id}`, { platform: "waha", conversationId: task.conversationId, message: "Hello", description: "Updated details" });
     expect(response.status).toBe(502);
     expect((await response.json() as any).error.code).toBe("MESSAGE_SEND_FAILED");
     expect(app.service.getTask(task.id).status).toBe("ACTIVE");
@@ -111,20 +111,20 @@ test("discovers phone-addressed contacts as LIDs and sends directly to the LID",
   expect(await adapter.listConversations()).toEqual([{ platform: "waha", conversationId: "999111222@lid", displayName: "Dental" }]);
   expect(calls[1]).toContain("/api/test-session/lids/pn/12025550101%40c.us");
   const app = createApplication({ apiToken: "api", webhookToken: "hook", store, platforms: [adapter], hermes: new InMemoryHermesAdapter() });
-  const task = app.service.createTask({ platform: "waha", conversationId: "999111222@lid", hermesSessionId: "session", title: "Book" });
-  await app.service.sendMessage(task.id, "Hello");
+  const task = app.service.createTask({ platform: "waha", conversationId: "999111222@lid", hermesSessionId: "session", description: "Book" });
+  await app.service.sendMessage(task.id, { platform: "waha", conversationId: task.conversationId, message: "Hello", description: "Latest state" });
   const reply = await app.service.receiveInbound("waha", { ...event, session: "test-session", payload: { ...event.payload, from: "999111222@lid" } });
   expect(reply.outcome).toBe("DELIVERED");
-  expect(reply.taskId).toBe(task.id);
+  expect(reply.taskIds).toEqual([task.id]);
 });
 
 test("WAHA API requires LIDs for task creation, filters, and action history", async () => {
   const { request } = setup();
   await request("/conversations?platform=waha");
   for (const conversationId of ["+12025550101", "12025550101@c.us", "123@g.us", "abc@lid"]) {
-    expect((await request("/tasks", { platform: "waha", conversationId, hermesSessionId: "s", title: "Test" })).status).toBe(400);
+    expect((await request("/tasks", { platform: "waha", conversationId, hermesSessionId: "s", description: "Test" })).status).toBe(400);
   }
-  const created = await (await request("/tasks", { platform: "waha", conversationId: "12025550101@lid", hermesSessionId: "s", title: "Test" })).json() as any;
+  const created = await (await request("/tasks", { platform: "waha", conversationId: "12025550101@lid", hermesSessionId: "s", description: "Test" })).json() as any;
   expect(created.task.conversationId).toBe("12025550101@lid");
   const filtered = await (await request("/tasks?platform=waha&conversationId=12025550101%40lid")).json() as any;
   expect(filtered.tasks).toHaveLength(1);

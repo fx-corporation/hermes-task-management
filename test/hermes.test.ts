@@ -27,7 +27,7 @@ describe("Hermes HTTP delivery", () => {
   test("sends session history continuation and an authenticated envelope with a stable retry key", async () => {
     const { adapter, calls } = setup([200]);
     await adapter.deliver(delivery);
-    expect(JSON.parse(calls[0]!.body as string)).toEqual({ message: delivery.envelope });
+    expect(JSON.parse(calls[0]!.body as string)).toEqual({ input: delivery.envelope });
     expect(new Headers(calls[0]!.headers).get("authorization")).toBe("Bearer secret");
     expect(new Headers(calls[0]!.headers).get("idempotency-key")).toHaveLength(64);
   });
@@ -80,11 +80,11 @@ describe("Hermes HTTP delivery", () => {
     try {
       const app = createApplication({ apiToken: "api", webhookToken: "hook", hermesOptions: { baseUrl: server.url.toString(), apiKey: "secret" } });
       expect(app.hermes).toBeInstanceOf(HttpHermesAdapter);
-      const task = app.service.createTask({ platform: "stub", conversationId: "+12025550101", hermesSessionId: "existing-session", title: "Book" });
-      await app.service.sendMessage(task.id, "Available?");
+      const task = app.service.createTask({ platform: "stub", conversationId: "+12025550101", hermesSessionId: "existing-session", description: "Book" });
+      await app.service.sendMessage(task.id, { platform: "stub", conversationId: task.conversationId, message: "Available?", description: "Book an appointment. Latest state: waiting for availability." });
       expect(await app.service.receiveInbound("stub", { conversationId: task.conversationId, externalMessageId: "reply", message: "Confirmed" })).toMatchObject({ outcome: "DELIVERED" });
       expect(received).toHaveLength(1);
-      expect(received[0]).toMatchObject({ message: expect.stringContaining("untrusted external content") });
+      expect(received[0]).toMatchObject({ input: expect.stringContaining("untrusted external content") });
       expect(task.status).toBe("ACTIVE");
     } finally { await server.stop(true); }
   });
@@ -107,8 +107,8 @@ describe("Hermes HTTP delivery", () => {
   test("records failed delivery without activating the task or repeating duplicate events", async () => {
     const { adapter, calls } = setup([503, 503], 1);
     const app = createApplication({ apiToken: "api", webhookToken: "hook", hermes: adapter });
-    const task = app.service.createTask({ platform: "stub", conversationId: "+12025550101", hermesSessionId: "existing-session", title: "Book" });
-    await app.service.sendMessage(task.id, "Available?");
+    const task = app.service.createTask({ platform: "stub", conversationId: "+12025550101", hermesSessionId: "existing-session", description: "Book" });
+    await app.service.sendMessage(task.id, { platform: "stub", conversationId: task.conversationId, message: "Available?", description: "Book an appointment." });
     const payload = { conversationId: task.conversationId, externalMessageId: "reply", message: "Confirmed" };
     await expect(app.service.receiveInbound("stub", payload)).rejects.toThrow("Hermes delivery failed");
     expect(task.status).toBe("WAITING_EXTERNAL_REPLY");

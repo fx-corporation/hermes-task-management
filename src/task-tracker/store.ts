@@ -10,7 +10,6 @@ import {
 export class InMemoryStore {
   readonly conversations = new Map<string, Conversation>();
   readonly tasks = new Map<string, MessagingTask>();
-  readonly activeTaskByConversation = new Map<string, string>();
   readonly inboundEvents = new Map<string, InboundEvent>();
   readonly actionsByConversation = new Map<string, ConversationAction[]>();
   private nextActionSequence = 1;
@@ -41,9 +40,11 @@ export class InMemoryStore {
     return this.conversations.get(conversationKey(platform, conversationId));
   }
 
-  getActiveTask(platform: Platform, conversationId: string): MessagingTask | undefined {
-    const id = this.activeTaskByConversation.get(conversationKey(platform, conversationId));
-    return id ? this.tasks.get(id) : undefined;
+  getOpenTasks(platform: Platform, conversationId: string): MessagingTask[] {
+    return [...this.tasks.values()].filter(task =>
+      task.platform === platform && task.conversationId === conversationId &&
+      (task.status === "ACTIVE" || task.status === "WAITING_EXTERNAL_REPLY")
+    );
   }
 
   reserveAction(
