@@ -1,4 +1,3 @@
-import supertest from "supertest";
 import { fetchApplication } from "./helpers.ts";
 import { describe, expect, test } from "bun:test";
 import { createApplication } from "../src/task-tracker/app.ts";
@@ -260,7 +259,9 @@ describe("task management API", () => {
     const queuedRequest = request(app, "/webhooks/stub", { method: "POST", webhook: true, body: {
       conversationId: second.conversationId, externalMessageId: "queued", message: "Two",
     } });
-    await Promise.resolve();
+    // Allow Fetch body reading to finish before closing the task already bound to the reply.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(app.store.inboundEvents.get("stub\u0000queued")?.taskIds).toEqual([second.id]);
     await request(app, `/tasks/${second.id}/complete`, { body: { result: "Closed while queued" } });
     releaseFirst();
 
@@ -294,20 +295,14 @@ describe("task management API", () => {
     expect(retry).toMatchObject({ eventId: first.eventId, outcome: "DELIVERED", duplicate: true });
   });
 
-  test("starts a live Express server and serves health and authenticated routes", async () => {
+  test("starts a live Hono server and serves health and authenticated routes", async () => {
     const { server, app } = startServer({
       MESSAGING_TASK_API_TOKEN: API_TOKEN,
       STUB_WEBHOOK_TOKEN: WEBHOOK_TOKEN,
       HERMES_API_KEY: "test-hermes-key",
       PORT: "0",
     });
-    await new Promise<void>((resolve, reject) => {
-      server.once("listening", resolve);
-      server.once("error", reject);
-    });
-    const address = server.address();
-    if (!address || typeof address === "string") throw new Error("Expected a TCP address.");
-    const serverUrl = `http://127.0.0.1:${address.port}`;
+    const serverUrl = server.url;
     try {
       const health = await fetch(new URL("/health", serverUrl));
       expect(await json(health)).toEqual({ success: true, status: "ok" });
@@ -317,35 +312,52 @@ describe("task management API", () => {
       expect((await json(conversations)).conversations).toHaveLength(2);
       expect(app.store.conversations.size).toBe(2);
       expect(app.hermes).toBeInstanceOf(HttpHermesAdapter);
+      const oversized = await fetch(new URL("/tasks", serverUrl), {
+        method: "POST", headers: { authorization: `Bearer ${API_TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({ description: "x".repeat(1024 * 1024) }),
+      });
+      expect(oversized.status).toBe(413);
+      expect((await json(oversized)).error.code).toBe("INVALID_REQUEST");
+      const head = await fetch(new URL("/tasks", serverUrl), { method: "HEAD", headers: { authorization: `Bearer ${API_TOKEN}` } });
+      expect(head.status).toBe(200);
+      expect(await head.text()).toBe("");
     } finally {
-      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+      await server.stop(true);
     }
   });
 
-  test("keeps Express parsing and routing errors in the API error format", async () => {
+  test("keeps Hono parsing and routing errors in the API error format", async () => {
     const { app } = setup();
-    const client = supertest(app.app);
     for (const path of ["/missing", "/Tasks", "/tasks/"]) {
-      const response = await client.get(path).set("authorization", `Bearer ${API_TOKEN}`);
+      const response = await request(app, path);
       expect(response.status).toBe(404);
-      expect(response.body.error.code).toBe("NOT_FOUND");
+      expect((await json(response)).error.code).toBe("NOT_FOUND");
     }
-    const malformedPath = await client.get("/tasks/%ZZ").set("authorization", `Bearer ${API_TOKEN}`);
+    const malformedPath = await request(app, "/tasks/%ZZ");
     expect(malformedPath.status).toBe(400);
-    expect(malformedPath.body.error.code).toBe("INVALID_REQUEST");
-    const oversized = await client.post("/tasks")
-      .set("authorization", `Bearer ${API_TOKEN}`).set("content-type", "application/json")
-      .send(JSON.stringify({ message: "x".repeat(1024 * 1024) }));
+    expect((await json(malformedPath)).error.code).toBe("INVALID_REQUEST");
+    const oversized = await request(app, "/tasks", { body: { message: "x".repeat(1024 * 1024) } });
     expect(oversized.status).toBe(413);
-    expect(oversized.body.error.code).toBe("INVALID_REQUEST");
-    const compressed = await client.post("/tasks")
-      .set("authorization", `Bearer ${API_TOKEN}`).set("content-type", "application/json")
-      .set("content-encoding", "gzip").send("{}");
+    expect((await json(oversized)).error.code).toBe("INVALID_REQUEST");
+    const streamed = await fetchApplication(app, new Request("http://localhost/tasks", {
+      method: "POST", headers: { authorization: `Bearer ${API_TOKEN}`, "content-type": "application/json" },
+      body: new ReadableStream<Uint8Array>({ start(controller) {
+        controller.enqueue(new Uint8Array(600_000));
+        controller.enqueue(new Uint8Array(600_000));
+        controller.close();
+      } }),
+    }));
+    expect(streamed.status).toBe(413);
+    expect((await json(streamed)).error.code).toBe("INVALID_REQUEST");
+    const compressed = await fetchApplication(app, new Request("http://localhost/tasks", {
+      method: "POST", headers: { authorization: `Bearer ${API_TOKEN}`, "content-type": "application/json", "content-encoding": "gzip" },
+      body: "{}",
+    }));
     expect(compressed.status).toBe(415);
-    expect(compressed.body.error.code).toBe("INVALID_REQUEST");
+    expect((await json(compressed)).error.code).toBe("INVALID_REQUEST");
   });
 
-  test("returns structured errors for rejected asynchronous Express handlers", async () => {
+  test("returns structured errors for rejected asynchronous Hono handlers", async () => {
     const app = createApplication({
       apiToken: API_TOKEN, webhookToken: WEBHOOK_TOKEN,
       hermes: new InMemoryHermesAdapter(),

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { startHermesStub } from "../src/hermes-stub/server.ts";
+import { createHermesStubApplication, startHermesStub } from "../src/hermes-stub/server.ts";
 import { HttpHermesAdapter } from "../src/task-tracker/http-hermes-adapter.ts";
 
 test("stub accepts adapter delivery and logs every request, including rejected and replayed requests", async () => {
@@ -34,4 +34,25 @@ test("stub accepts adapter delivery and logs every request, including rejected a
     expect(logs[6]).toMatchObject({ method: "PUT", body: "debug body" });
     expect(logs[7]!.body).toBe("bad JSON");
   } finally { await server.stop(true); }
+});
+
+
+test("stub Hono routes preserve strict paths, decode session IDs once, and reject unsupported methods", async () => {
+  const app = createHermesStubApplication({ log: () => {} });
+  for (const path of ["/Health", "/health/", "/api/tracker/tasks/task/actions"]) {
+    expect((await app.request(path)).status).toBe(404);
+  }
+  const head = await app.request("/api/events/stream", { method: "HEAD" });
+  expect(head.status).toBe(404);
+  expect(await head.text()).toBe("");
+  const chat = await app.request("/api/sessions/session%252F%20one/chat", {
+    method: "POST", body: JSON.stringify({ input: "Hello" }),
+  });
+  expect(chat.status).toBe(200);
+  expect((await chat.json()).session_id).toBe("session%2F one");
+  const malformed = await app.request("/api/sessions/%ZZ/chat", {
+    method: "POST", body: JSON.stringify({ input: "Hello" }),
+  });
+  expect(malformed.status).toBe(400);
+  expect((await (await app.request("/api/events")).json()).events).toHaveLength(1);
 });

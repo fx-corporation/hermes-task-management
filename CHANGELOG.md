@@ -9,6 +9,67 @@ Repository-wide instructions are in [AGENTS.md](AGENTS.md).
 
 ## Unreleased
 
+### 2026-10-05 — Migrate to Hono, add task selection, organize code, and fix Docker tests
+
+- **Agent:** Codex
+- **Changes:** Migrated `src/task-tracker/app.ts` and
+  `src/hermes-stub/server.ts` to Hono routes, middleware, and error handlers.
+  Both services use Bun's Fetch server; `src/task-tracker/server.ts` supports
+  shutdown with `stop()`, and `createHermesStubApplication()` supports direct
+  Fetch usage. Preserved exact request bytes for WAHA webhook validation.
+  Added Hono and removed Express, Supertest, and their types from
+  `package.json` and `bun.lock`.
+  Added the Hermes task-selection form, now in
+  `src/hermes-stub/frontend/components/TaskSelection.tsx`, and success styling
+  in `frontend/styles.css`. It accepts platform, conversation ID, original
+  webhook text, and comma/newline-separated task IDs; normalizes identifiers,
+  rejects duplicates, preserves failed input, resets after success, and submits
+  through `/api/tracker/tasks/selection` without requiring a selected task.
+  Split `frontend/App.tsx` into components, `hooks/useTaskConsole.ts`, and
+  shared action/URL modules. Gave every endpoint in both services its own
+  `handlers/` file; separated service setup, request middleware, proxying,
+  validation, and stub state from route registration.
+  Extracted task-tracker classes, interfaces, and domain types into individual
+  files grouped under `src/task-tracker/domain/`, `platforms/` (including
+  `stub/` and `waha/`), `hermes/`, `classification/`, `services/`, `storage/`,
+  `application/`, and `errors/`; updated imports and retained root public
+  exports for existing callers.
+  Updated `test/helpers.ts`, `test/api.test.ts`, `test/hermes-stub.test.ts`,
+  `test/hermes-ui.test.ts`, and `test/hermes-react.test.ts` for Fetch/Bun APIs,
+  signed webhooks, streaming body limits, session decoding, queue ordering,
+  and task-selection workflows. Updated the signed WAHA proxy test in
+  `test/hermes-ui.test.ts` to inject `InMemoryHermesAdapter` and assert that
+  a reply with no active task does not produce a Hermes delivery.
+  Updated `README.md` with Hono/Bun APIs,
+  owner-review instructions, and the source layout. Consolidated the pending
+  records in `CHANGELOG.md` into this entry.
+- **Why:** Use Hono consistently while preserving API contracts,
+  authentication, body limits, signed webhooks, proxying, logging, and UI event
+  streaming; support manual owner-review task selection; and make components,
+  endpoint behavior, and related classes/types easier to locate and read.
+  Explicit test configuration removes the signed WAHA proxy test's dependency
+  on `HERMES_API_KEY` from the local environment, fixing Docker builds where
+  `.env` files are excluded while preserving production configuration validation.
+- **Validation:** Previously completed `bun run typecheck`, full `bun run test`
+  (45 tests and 395 assertions, including the UI build), `bun run build`, the
+  Hermes stub Bun bundle, `bun install --frozen-lockfile`, and targeted React/UI
+  tests passed. Typechecking, the full suite/UI build, and both server bundles
+  were repeated after folder grouping and passed. AST inspections confirmed
+  14 distinct task-tracker endpoint handlers, 16 distinct Hermes stub endpoint
+  handlers, and 26 task-tracker classes/interfaces with one definition per file
+  in the grouped folders. No Express or Supertest references remained in
+  source, tests, dependency files, or README. Subsequent Docker validation
+  reproduced the task-tracker build failure (44 passing tests, one failing
+  signed WAHA proxy test with `HERMES_API_KEY is required.`); the Hermes stub
+  image build passed. After fixing the test configuration, the task-tracker
+  Docker image build passed, including typechecking, the UI build, all 45
+  tests (396 assertions), and the server bundle. Both built images passed
+  container health checks, and the Hermes stub served its UI successfully.
+  Live WAHA and Hermes services were not exercised. For this documentation
+  consolidation, verified committed changelog history is unchanged and
+  `git diff --check` passes; tests were not rerun because only the changelog
+  text changed.
+
 ### 2026-10-04 — Route concurrent tasks with local Ollama classification
 
 - **Agent:** Codex

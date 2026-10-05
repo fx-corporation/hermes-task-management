@@ -1,0 +1,2 @@
+export type ActionType =
+  "MESSAGE_SENT" | "WEBHOOK_RECEIVED" | "HERMES_DELIVERED";

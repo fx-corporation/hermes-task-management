@@ -1,199 +1,86 @@
-import { receivedMessage, type MessageEvent } from "./events.ts";
-import type { MessagingTask } from "../task-tracker/domain.ts";
-import { resolve, sep } from "node:path";
+import { Hono } from "hono";
+import { assetHandler } from "./handlers/asset.ts";
+import { cancelTrackerTaskHandler } from "./handlers/cancel-tracker-task.ts";
+import { chatCompletionsHandler } from "./handlers/chat-completions.ts";
+import { completeTrackerTaskHandler } from "./handlers/complete-tracker-task.ts";
+import { createSessionHandler } from "./handlers/create-session.ts";
+import { createTrackerTaskHandler } from "./handlers/create-tracker-task.ts";
+import { healthHandler } from "./handlers/health.ts";
+import { indexHandler } from "./handlers/index.ts";
+import { listEventsHandler } from "./handlers/list-events.ts";
+import { listTrackerConversationsHandler } from "./handlers/list-tracker-conversations.ts";
+import { listTrackerTasksHandler } from "./handlers/list-tracker-tasks.ts";
+import { selectTrackerTasksHandler } from "./handlers/select-tracker-tasks.ts";
+import { sendTrackerTaskMessageHandler } from "./handlers/send-tracker-task-message.ts";
+import { sessionChatHandler } from "./handlers/session-chat.ts";
+import { streamEventsHandler } from "./handlers/stream-events.ts";
+import { wahaWebhookHandler } from "./handlers/waha-webhook.ts";
+import type { HermesStubEnv } from "./hermes-stub-env.ts";
+import type { HermesStubOptions } from "./hermes-stub-options.ts";
+import { logRequest } from "./http/log-request.ts";
+import { createStubState } from "./stub-state.ts";
+
+export type { HermesStubOptions } from "./hermes-stub-options.ts";
 
 /** Development receiver: delivers session callbacks to the UI without agent reasoning. */
-export function startHermesStub(options: {
-  port?: number;
-  hostname?: string;
-  uiDir?: string;
-  taskTrackerUrl?: string;
-  taskTrackerToken?: string;
-  scoringFixtures?: unknown[];
-  log?: (request: Record<string, unknown>) => void;
-} = {}) {
-  const uiDir = resolve(options.uiDir ?? process.env.HERMES_STUB_UI_DIR ?? "dist/hermes-stub/ui");
-  const events: MessageEvent[] = [];
-  const tasks = new Map<string, MessagingTask>();
-  const clients = new Set<ReadableStreamDefaultController<Uint8Array>>();
-  const encoder = new TextEncoder();
-  const broadcast = (event: MessageEvent) => {
-    events.push(event);
-    const chunk = encoder.encode(`event: message\ndata: ${JSON.stringify(event)}\n\n`);
-    for (const client of clients) {
-      try { client.enqueue(chunk); } catch { clients.delete(client); }
-    }
-  };
-  const tracker = options.taskTrackerUrl ?? "http://127.0.0.1:9005";
-  const proxy = async (path: string, request: Request, body: string, webhook = false) => {
-    const headers = webhook ? new Headers(request.headers) : new Headers();
-    headers.delete("host");
-    headers.delete("content-length");
-    if (!webhook) {
-      headers.set("authorization", `Bearer ${options.taskTrackerToken ?? ""}`);
-      headers.set("content-type", "application/json");
-    }
-    try {
-      const upstream = await fetch(new URL(path, tracker), {
-        method: request.method, headers,
-        body: request.method === "GET" ? undefined : body,
-        signal: AbortSignal.timeout(webhook ? 600_000 : 30_000), redirect: "error",
-      });
-      return new Response(await upstream.text(), { status: upstream.status, headers: { "content-type": "application/json" } });
-    } catch {
-      return Response.json({ error: { message: "Task tracker is unavailable." } }, { status: 502 });
-    }
-  };
-  const chats = new Map<string, { body: string; completion: object }>();
-  const scoringFixtures = [...(options.scoringFixtures ?? scoringFixturesFromEnvironment())];
-  const log = options.log ?? (request => console.log("Hermes stub request", request));
+export function createHermesStubApplication(options: HermesStubOptions = {}) {
+  const app = new Hono<HermesStubEnv>({ strict: true });
+  const state = createStubState(options);
+  const log =
+    options.log ?? ((request) => console.log("Hermes stub request", request));
+  app.use(logRequest(log));
+  app.get("/", indexHandler(state));
+  app.get("/assets/*", assetHandler(state));
+  app.get("/api/events", listEventsHandler(state));
+  app.get("/api/events/stream", streamEventsHandler(state));
+  app.get("/api/tracker/tasks", listTrackerTasksHandler(state));
+  app.get("/api/tracker/conversations", listTrackerConversationsHandler(state));
+  app.post("/api/tracker/tasks", createTrackerTaskHandler(state));
+  app.post("/api/tracker/tasks/selection", selectTrackerTasksHandler(state));
+  app.post("/api/tracker/tasks/:taskId", sendTrackerTaskMessageHandler(state));
+  app.post(
+    "/api/tracker/tasks/:taskId/complete",
+    completeTrackerTaskHandler(state),
+  );
+  app.post(
+    "/api/tracker/tasks/:taskId/cancel",
+    cancelTrackerTaskHandler(state),
+  );
+  app.post("/webhooks/waha", wahaWebhookHandler(state));
+  app.get("/health", healthHandler());
+  app.post("/api/sessions", createSessionHandler());
+  app.post("/v1/chat/completions", chatCompletionsHandler(state));
+  app.post("/api/sessions/:sessionId/chat", sessionChatHandler(state));
+  app.notFound((context) => context.json({ error: "Not found" }, 404));
+  app.onError((error, context) => {
+    if (error instanceof URIError)
+      return context.json({ error: "Invalid URL encoding" }, 400);
+    console.error("Hermes stub error", error);
+    return context.json({ error: "An unexpected error occurred." }, 500);
+  });
+  return app;
+}
+
+export function startHermesStub(options: HermesStubOptions = {}) {
+  const app = createHermesStubApplication(options);
   return Bun.serve({
     hostname: options.hostname ?? "127.0.0.1",
     port: options.port ?? 8643,
-    async fetch(request, server) {
-      const body = await request.text();
-      log({
-        timestamp: new Date().toISOString(),
-        method: request.method,
-        url: request.url,
-        headers: Object.fromEntries(request.headers.entries()),
-        body,
-      });
-      const url = new URL(request.url);
-      const path = url.pathname;
-      if (request.method === "GET" && (path === "/" || path.startsWith("/assets/"))) {
-        let filePath: string;
-        try { filePath = resolve(uiDir, path === "/" ? "index.html" : `.${decodeURIComponent(path)}`); }
-        catch { return Response.json({ error: "Invalid asset path" }, { status: 400 }); }
-        if (!filePath.startsWith(uiDir + sep)) return Response.json({ error: "Not found" }, { status: 404 });
-        const file = Bun.file(filePath);
-        if (!await file.exists()) return Response.json({ error: "UI assets missing. Run bun run build:hermes-ui." }, { status: 404 });
-        return new Response(file);
-      }
-      if (request.method === "GET" && path === "/api/events") return Response.json({ events });
-      if (request.method === "GET" && path === "/api/events/stream") {
-        server.timeout(request, 0);
-        let controller: ReadableStreamDefaultController<Uint8Array>;
-        let heartbeat: ReturnType<typeof setInterval>;
-        const cleanup = () => { clearInterval(heartbeat); clients.delete(controller); };
-        const stream = new ReadableStream<Uint8Array>({
-          start(value) {
-            controller = value; clients.add(controller);
-            controller.enqueue(encoder.encode(`event: snapshot\ndata: ${JSON.stringify(events)}\n\n`));
-            heartbeat = setInterval(() => {
-              try { controller.enqueue(encoder.encode(": keepalive\n\n")); } catch { cleanup(); }
-            }, 15_000);
-            request.signal.addEventListener("abort", () => { cleanup(); try { controller.close(); } catch {} }, { once: true });
-          },
-          cancel() { cleanup(); },
-        });
-        return new Response(stream, { headers: { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" } });
-      }
-      if (path.startsWith("/api/tracker/")) {
-        server.timeout(request, 0); // The bounded upstream timeout governs proxy requests.
-        const target = path.slice("/api/tracker".length);
-        const allowed = request.method === "GET"
-          ? /^\/(tasks|conversations)$/.test(target)
-          : request.method === "POST" && (target === "/tasks" || target === "/tasks/selection" || /^\/tasks\/[^/]+(\/(complete|cancel))?$/.test(target));
-        if (!allowed) return Response.json({ error: "Not found" }, { status: 404 });
-        const response = await proxy(target + url.search, request, body);
-        if (response.ok) {
-          const result = await response.clone().json();
-          if (target === "/tasks") {
-            for (const task of result.tasks ?? (result.task ? [result.task] : [])) tasks.set(task.id, task);
-          }
-          const send = target.match(/^\/tasks\/([^/]+)$/);
-          if (send) {
-            const task = tasks.get(decodeURIComponent(send[1]!));
-            const result = await response.clone().json() as { status?: string; description?: string };
-            if (task) {
-              if (typeof result.status === "string") task.status = result.status as MessagingTask["status"];
-              if (typeof result.description === "string") task.description = result.description;
-              broadcast({ id: crypto.randomUUID(), sessionId: task.hermesSessionId, taskId: task.id, sender: "You", message: JSON.parse(body).message, timestamp: new Date().toISOString(), direction: "sent" });
-            }
-          }
-        }
-        return response;
-      }
-      if (request.method === "POST" && path === "/webhooks/waha") {
-        server.timeout(request, 0); // Synchronous Hermes turns may exceed Bun's idle timeout.
-        // Forward exact bytes and authentication so task tracker remains the validator.
-        return proxy("/webhooks/waha", request, body, true);
-      }
-      if (request.method === "GET" && path === "/health") {
-        return Response.json({ status: "ok", service: "hermes-stub" });
-      }
-      if (request.method === "POST" && path === "/api/sessions") {
-        const sessionId = `stub-owner-${crypto.randomUUID()}`;
-        return Response.json({ id: sessionId }, { status: 201 });
-      }
-      if (request.method === "POST" && path === "/v1/chat/completions") {
-        let payload: unknown;
-        try { payload = JSON.parse(body); } catch { return Response.json({ error: "Invalid JSON" }, { status: 400 }); }
-        const messages = payload && typeof payload === "object" && "messages" in payload && Array.isArray(payload.messages)
-          ? payload.messages as { role?: unknown; content?: unknown }[]
-          : [];
-        const userContent = messages.find(message => message.role === "user")?.content;
-        let candidates: { taskId: string }[] = [];
-        if (typeof userContent === "string") {
-          try {
-            const input = JSON.parse(userContent) as { candidates?: unknown };
-            if (Array.isArray(input.candidates)) candidates = input.candidates.filter((item): item is { taskId: string } =>
-              !!item && typeof item === "object" && "taskId" in item && typeof item.taskId === "string");
-          } catch { /* Malformed model input receives the configured/default fixture. */ }
-        }
-        const fixture = scoringFixtures.shift() ?? { scores: candidates.map(candidate => ({ taskId: candidate.taskId, confidence: 0.5 })) };
-        return Response.json({ choices: [{ message: { role: "assistant", content: JSON.stringify(fixture) } }] });
-      }
-      const chat = path.match(/^\/api\/sessions\/([^/]+)\/chat$/);
-      if (request.method !== "POST" || !chat) {
-        return Response.json({ error: "Not found" }, { status: 404 });
-      }
-      let payload: unknown;
-      try { payload = JSON.parse(body); } catch {
-        return Response.json({ error: "Invalid JSON" }, { status: 400 });
-      }
-      if (!payload || typeof payload !== "object" ||
-          !("input" in payload) || typeof payload.input !== "string" || !payload.input.trim()) {
-        return Response.json({ error: "input is a required string" }, { status: 400 });
-      }
-      const sessionId = decodeURIComponent(chat[1]!);
-      const requestKey = request.headers.get("idempotency-key");
-      const key = requestKey ? `${sessionId}:${requestKey}` : null;
-      const previous = key ? chats.get(key) : undefined;
-      if (previous && previous.body !== body) {
-        return Response.json({ error: { code: "idempotency_key_conflict" } }, { status: 409 });
-      }
-      const completion = previous?.completion ?? {
-        object: "hermes.session.chat.completion",
-        session_id: sessionId,
-        message: { role: "assistant", content: "Reply received by Hermes development stub." },
-        usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
-      };
-      if (!previous) broadcast(receivedMessage(sessionId, payload.input));
-      if (key && !previous) chats.set(key, { body, completion });
-      return Response.json(completion, {
-        status: 200,
-        headers: previous ? { "Idempotency-Replayed": "true" } : undefined,
-      });
-    },
+    fetch: (request, server) => app.fetch(request, { server }),
   });
 }
 
-function scoringFixturesFromEnvironment(): unknown[] {
-  const configured = process.env.HERMES_STUB_SCORING_FIXTURES;
-  if (!configured) return [];
-  let fixtures: unknown;
-  try { fixtures = JSON.parse(configured) as unknown; }
-  catch { throw new Error("HERMES_STUB_SCORING_FIXTURES must be a JSON array."); }
-  if (!Array.isArray(fixtures)) throw new Error("HERMES_STUB_SCORING_FIXTURES must be a JSON array.");
-  return fixtures;
-}
-
 if (import.meta.main) {
-  const server = startHermesStub({ port: Number(process.env.HERMES_STUB_PORT ?? 8643), hostname: process.env.HERMES_STUB_HOST ?? "127.0.0.1", taskTrackerUrl: process.env.TASK_TRACKER_BASE_URL, taskTrackerToken: process.env.MESSAGING_TASK_API_TOKEN });
+  const server = startHermesStub({
+    port: Number(process.env.HERMES_STUB_PORT ?? 8643),
+    hostname: process.env.HERMES_STUB_HOST ?? "127.0.0.1",
+    taskTrackerUrl: process.env.TASK_TRACKER_BASE_URL,
+    taskTrackerToken: process.env.MESSAGING_TASK_API_TOKEN,
+  });
   console.log(`Hermes stub listening at ${server.url}`);
-  const stop = () => { void server.stop(true); };
+  const stop = () => {
+    void server.stop(true);
+  };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
 }

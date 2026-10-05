@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
+import { createHmac } from "node:crypto";
 import { createApplication } from "../src/task-tracker/app.ts";
+import { InMemoryHermesAdapter } from "../src/task-tracker/adapters.ts";
 import { InMemoryStore } from "../src/task-tracker/store.ts";
 import { WahaPlatformAdapter } from "../src/task-tracker/waha-adapter.ts";
 import { HttpHermesAdapter } from "../src/task-tracker/http-hermes-adapter.ts";
@@ -16,12 +18,9 @@ test("UI API creates, sends through WAHA, displays authenticated webhook replies
   const app = createApplication({ apiToken: "api-secret", webhookToken: "hook-secret", store, platform, hermes: {
     async deliver(delivery) { await new HttpHermesAdapter({ baseUrl: stubUrl, apiKey: "dev" }).deliver(delivery); },
   } });
-  const tracker = app.app.listen(0, "127.0.0.1");
-  await new Promise<void>(resolve => tracker.once("listening", resolve));
-  const address = tracker.address();
-  if (!address || typeof address === "string") throw Error("Missing address");
+  const tracker = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: app.app.fetch, idleTimeout: 0 });
   const logs: Record<string, unknown>[] = [];
-  const stub = startHermesStub({ port: 0, taskTrackerUrl: `http://127.0.0.1:${address.port}`, taskTrackerToken: "api-secret", log: r => logs.push(r) });
+  const stub = startHermesStub({ port: 0, taskTrackerUrl: tracker.url.toString(), taskTrackerToken: "api-secret", log: r => logs.push(r) });
   stubUrl = stub.url.toString();
   const call = async (path: string, body?: unknown, headers: Record<string, string> = {}) => {
     const r = await fetch(new URL(path, stub.url), { method: body === undefined ? "GET" : "POST", headers: { "content-type": "application/json", ...headers }, body: body === undefined ? undefined : JSON.stringify(body) });
@@ -49,7 +48,7 @@ test("UI API creates, sends through WAHA, displays authenticated webhook replies
     try {
       expect(new TextDecoder().decode((await reader.read()).value)).toContain("event: snapshot");
       // WAHA talks directly to task tracker: only the Hermes callback reaches the UI.
-      const webhook = () => fetch(`http://127.0.0.1:${address.port}/webhooks/waha`, { method: "POST", headers: { authorization: "Bearer hook-secret", "content-type": "application/json" }, body: JSON.stringify(event) });
+      const webhook = () => fetch(new URL("/webhooks/waha", tracker.url), { method: "POST", headers: { authorization: "Bearer hook-secret", "content-type": "application/json" }, body: JSON.stringify(event) });
       expect((await (await webhook()).json()).outcome).toBe("DELIVERED");
       const pushed = new TextDecoder().decode((await reader.read()).value);
       expect(pushed).toContain("event: message");
@@ -76,9 +75,54 @@ test("UI API creates, sends through WAHA, displays authenticated webhook replies
     expect((await call(`api/tracker/tasks/${task.id}/complete`, { result: "Booked" })).data.status).toBe("COMPLETED");
     const next = (await call("api/tracker/tasks", { platform: "waha", conversationId: "12025550101@lid", hermesSessionId: "ui-session", description: "Follow up next week." })).data.task;
     expect((await call(`api/tracker/tasks/${next.id}/cancel`, { reason: "Changed plans" })).data.status).toBe("CANCELLED");
+    const selectionTask = (await call("api/tracker/tasks", { platform: "waha", conversationId: "12025550101@lid", hermesSessionId: "manual-selection-session", description: "Manual owner-selected task." })).data.task;
+    const selection = await call("api/tracker/tasks/selection", {
+      webhookMessage: "Owner selected this task.", platform: "waha", conversationId: "12025550101@lid", taskIds: [selectionTask.id],
+    });
+    expect(selection.status).toBe(200);
+    expect(selection.data).toMatchObject({ success: true, routingOutcome: "MANUAL_SELECTION", taskIds: [selectionTask.id] });
+    const invalidSelection = await call("api/tracker/tasks/selection", {
+      webhookMessage: "Owner selected this task.", platform: "waha", conversationId: "12025550101@lid", taskIds: [selectionTask.id, selectionTask.id],
+    });
+    expect(invalidSelection.status).toBe(400);
+    expect(invalidSelection.data.error).toMatchObject({ code: "INVALID_REQUEST" });
+    expect(logs.some(r => String(r.url).endsWith("/api/tracker/tasks/selection"))).toBe(true);
+    expect(logs.some(r => String(r.url).endsWith("/api/sessions/manual-selection-session/chat"))).toBe(true);
+    const selectionEvents = (await call("api/events")).data.events;
+    expect(selectionEvents.some((event: any) => event.taskId === selectionTask.id && event.message.includes("Owner selected this task."))).toBe(true);
     expect(logs.some(r => String(r.url).endsWith("/api/sessions/ui-session/chat"))).toBe(true);
   } finally {
     await stub.stop(true);
-    await new Promise<void>((resolve, reject) => tracker.close(e => e ? reject(e) : resolve()));
+    await tracker.stop(true);
+  }
+});
+
+
+test("stub proxy preserves signed WAHA bytes and authentication through both Hono services", async () => {
+  const store = new InMemoryStore(false);
+  const platform = new WahaPlatformAdapter(store, { baseUrl: "http://waha", apiKey: "", hmacKey: "test-hmac" });
+  const hermes = new InMemoryHermesAdapter();
+  const app = createApplication({ apiToken: "api", webhookToken: "", store, platform, hermes });
+  const tracker = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: app.app.fetch });
+  const stub = startHermesStub({ port: 0, taskTrackerUrl: tracker.url.toString(), log: () => {} });
+  const raw = JSON.stringify({ event: "message", session: "default", payload: {
+    id: "signed-reply", from: "12025550101@lid", fromMe: false, body: "Confirmed ✓", timestamp: 1750000000,
+  } }, null, 2) + "\n";
+  const signature = createHmac("sha512", "test-hmac").update(raw).digest("hex");
+  const send = (body: string) => fetch(new URL("/webhooks/waha", stub.url), {
+    method: "POST", headers: { "content-type": "application/json", "x-webhook-hmac-algorithm": "sha512", "x-webhook-hmac": signature }, body,
+  });
+  try {
+    const accepted = await send(raw);
+    expect(accepted.status).toBe(200);
+    expect((await accepted.json()).outcome).toBe("IGNORED_NO_ACTIVE_TASK");
+    const tampered = await send(raw + " ");
+    expect(tampered.status).toBe(401);
+    expect((await tampered.json()).error.code).toBe("WEBHOOK_AUTHENTICATION_FAILED");
+    expect(store.inboundEvents.size).toBe(1);
+    expect(hermes.deliveries).toHaveLength(0);
+  } finally {
+    await stub.stop(true);
+    await tracker.stop(true);
   }
 });

@@ -1,105 +1,14 @@
-export const PLATFORM = "stub" as const;
-
-export type Platform = typeof PLATFORM | "waha";
-
-export type TaskStatus =
-  | "ACTIVE"
-  | "WAITING_EXTERNAL_REPLY"
-  | "COMPLETED"
-  | "CANCELLED";
-
-export interface Conversation {
-  platform: Platform;
-  conversationId: string;
-  displayName: string;
-}
-
-export interface MessagingTask {
-  id: string;
-  description: string;
-  platform: Platform;
-  conversationId: string;
-  hermesSessionId: string;
-  status: TaskStatus;
-  result: string | null;
-  cancelReason: string | null;
-  createdAt: string;
-  updatedAt: string;
-  completedAt: string | null;
-}
-
-export type ActionType = "MESSAGE_SENT" | "WEBHOOK_RECEIVED" | "HERMES_DELIVERED";
-
-export type EventOutcome =
-  | "PENDING_HERMES"
-  | "PENDING_OWNER_SELECTION"
-  | "DELIVERED"
-  | "IGNORED_NO_ACTIVE_TASK"
-  | "IGNORED_TASK_CLOSED"
-  | "DELIVERY_FAILED"
-  | "OWNER_REVIEW_FAILED";
-
-export type RoutingOutcome =
-  | "AUTO_ROUTED"
-  | "OWNER_REVIEW"
-  | "MANUAL_SELECTION"
-  | "IGNORED_NO_ACTIVE_TASK"
-  | "IGNORED_TASK_CLOSED"
-  | "DELIVERY_FAILED"
-  | "OWNER_REVIEW_FAILED";
-
-export interface ConversationAction {
-  id: string;
-  sequence: number;
-  timestamp: string;
-  type: ActionType;
-  platform: Platform;
-  conversationId: string;
-  taskId?: string;
-  taskIds?: string[];
-  hermesSessionId?: string;
-  externalMessageId?: string;
-  message: string;
-  outcome: string;
-  envelope?: string;
-}
-
-export interface InboundMessage {
-  platform: Platform;
-  conversationId: string;
-  externalMessageId: string;
-  senderId: string;
-  senderDisplayName: string;
-  content: string;
-  timestamp: string;
-}
-
-export interface InboundEvent {
-  id: string;
-  deduplicationKey: string;
-  message: InboundMessage;
-  taskIds: string[];
-  actionId: string;
-  outcome: EventOutcome;
-  routingOutcome: RoutingOutcome;
-  ownerSessionId?: string;
-}
-
-export interface HermesDelivery {
-  sessionId: string;
-  taskId: string;
-  platform: Platform;
-  senderDisplayName: string;
-  externalMessageId: string;
-  content: string;
-  envelope: string;
-  deliveredAt: string;
-}
-
-export function isOpenTask(status: TaskStatus): boolean {
-  return status === "ACTIVE" || status === "WAITING_EXTERNAL_REPLY";
-}
-
-export function conversationKey(platform: Platform, conversationId: string): string {
-  return `${platform}\u0000${conversationId}`;
-}
+export type { ActionType } from "./domain/action-type.ts";
+export type { ConversationAction } from "./domain/conversation-action.ts";
+export { conversationKey } from "./domain/conversation-key.ts";
+export type { Conversation } from "./domain/conversation.ts";
+export type { EventOutcome } from "./domain/event-outcome.ts";
+export type { HermesDelivery } from "./hermes/hermes-delivery.ts";
+export type { InboundEvent } from "./domain/inbound-event.ts";
+export type { InboundMessage } from "./domain/inbound-message.ts";
+export { isOpenTask } from "./domain/is-open-task.ts";
+export type { MessagingTask } from "./domain/messaging-task.ts";
+export { PLATFORM } from "./domain/platform.ts";
+export type { Platform } from "./domain/platform.ts";
+export type { RoutingOutcome } from "./domain/routing-outcome.ts";
+export type { TaskStatus } from "./domain/task-status.ts";
