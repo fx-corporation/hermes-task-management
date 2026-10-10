@@ -2,6 +2,7 @@ plans/**
 node_modules/
 bun.lockb
 dist/
+data/**
 .env
 .env.*
 .waha/*

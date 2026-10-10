@@ -35,7 +35,7 @@ export function listTasksHandler(
       : undefined;
     return context.json({
       success: true,
-      tasks: service.listTasks({
+      tasks: await service.listTasks({
         status: statusFilter,
         platform: platformValue,
         conversationId,

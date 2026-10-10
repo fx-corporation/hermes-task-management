@@ -78,9 +78,9 @@ describe("Hermes HTTP delivery", () => {
       return Response.json({ session_id: "existing-session", message: { role: "assistant", content: "Received" } });
     } });
     try {
-      const app = createApplication({ apiToken: "api", webhookToken: "hook", hermesOptions: { baseUrl: server.url.toString(), apiKey: "secret" } });
+      const app = await createApplication({ apiToken: "api", webhookToken: "hook", hermesOptions: { baseUrl: server.url.toString(), apiKey: "secret" } });
       expect(app.hermes).toBeInstanceOf(HttpHermesAdapter);
-      const task = app.service.createTask({ platform: "stub", conversationId: "+12025550101", hermesSessionId: "existing-session", description: "Book" });
+      const task = await app.service.createTask({ platform: "stub", conversationId: "+12025550101", hermesSessionId: "existing-session", description: "Book" });
       await app.service.sendMessage(task.id, { platform: "stub", conversationId: task.conversationId, message: "Available?", description: "Book an appointment. Latest state: waiting for availability." });
       expect(await app.service.receiveInbound("stub", { conversationId: task.conversationId, externalMessageId: "reply", message: "Confirmed" })).toMatchObject({ outcome: "DELIVERED" });
       expect(received).toHaveLength(1);
@@ -106,14 +106,14 @@ describe("Hermes HTTP delivery", () => {
   });
   test("records failed delivery without activating the task or repeating duplicate events", async () => {
     const { adapter, calls } = setup([503, 503], 1);
-    const app = createApplication({ apiToken: "api", webhookToken: "hook", hermes: adapter });
-    const task = app.service.createTask({ platform: "stub", conversationId: "+12025550101", hermesSessionId: "existing-session", description: "Book" });
+    const app = await createApplication({ apiToken: "api", webhookToken: "hook", hermes: adapter });
+    const task = await app.service.createTask({ platform: "stub", conversationId: "+12025550101", hermesSessionId: "existing-session", description: "Book" });
     await app.service.sendMessage(task.id, { platform: "stub", conversationId: task.conversationId, message: "Available?", description: "Book an appointment." });
     const payload = { conversationId: task.conversationId, externalMessageId: "reply", message: "Confirmed" };
     await expect(app.service.receiveInbound("stub", payload)).rejects.toThrow("Hermes delivery failed");
     expect(task.status).toBe("WAITING_EXTERNAL_REPLY");
     expect(await app.service.receiveInbound("stub", payload)).toMatchObject({ outcome: "DELIVERY_FAILED", duplicate: true });
     expect(calls).toHaveLength(2);
-    expect(app.store.getConversationActions("stub", task.conversationId).map(a => a.type)).not.toContain("HERMES_DELIVERED");
+    expect((await app.store.getConversationActions("stub", task.conversationId)).map(a => a.type)).not.toContain("HERMES_DELIVERED");
   });
 });

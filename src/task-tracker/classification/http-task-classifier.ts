@@ -84,7 +84,7 @@ export class HttpTaskClassifier implements TaskClassifier {
   }
 
   async classify(input: ClassifyInput): Promise<string[]> {
-    const candidates = this.options.store.getOpenTasks(
+    const candidates = await this.options.store.getOpenTasks(
       input.platform,
       input.conversationId,
     );
@@ -134,8 +134,8 @@ export class HttpTaskClassifier implements TaskClassifier {
   async checkWithUser(
     input: ClassifyInput & { taskIds: string[] },
   ): Promise<string> {
-    const candidates = input.taskIds.map((taskId) => {
-      const task = this.options.store.tasks.get(taskId);
+    const candidates = await Promise.all(input.taskIds.map(async (taskId) => {
+      const task = await this.options.store.getTask(taskId);
       if (
         !task ||
         task.platform !== input.platform ||
@@ -146,7 +146,7 @@ export class HttpTaskClassifier implements TaskClassifier {
         );
       }
       return task;
-    });
+    }));
     const callbackBody = {
       webhookMessage: input.webhookMessage,
       platform: input.platform,

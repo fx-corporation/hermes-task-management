@@ -1,14 +1,16 @@
 import { ApiError } from "../errors/api-error.ts";
 import { type EventOutcome } from "../domain/event-outcome.ts";
+import type { ConversationAction } from "../domain/conversation-action.ts";
 import type { HermesDeliveryAdapter } from "../hermes/hermes-delivery-adapter.ts";
 import { type HermesDelivery } from "../hermes/hermes-delivery.ts";
 import { type InboundEvent } from "../domain/inbound-event.ts";
+import type { InboundMessage } from "../domain/inbound-message.ts";
 import { isOpenTask } from "../domain/is-open-task.ts";
 import { type MessagingTask } from "../domain/messaging-task.ts";
 import type { PlatformAdapterRegistry } from "../platforms/platform-adapter-registry.ts";
 import { type Platform } from "../domain/platform.ts";
 import { type RoutingOutcome } from "../domain/routing-outcome.ts";
-import { InMemoryStore } from "../storage/store.ts";
+import type { Store } from "../storage/store.ts";
 import type { TaskClassifier } from "../classification/task-classifier.ts";
 import { type TaskStatus } from "../domain/task-status.ts";
 
@@ -21,26 +23,36 @@ const UNTRUSTED_ENVELOPE = (delivery: HermesDelivery): string =>
 
 import type { DeliveryResult } from "./delivery-result.ts";
 
+type WebhookResponse = {
+  eventId: string | null;
+  outcome: EventOutcome | "IGNORED_EVENT";
+  duplicate: boolean;
+  taskIds: string[];
+  routingOutcome: RoutingOutcome | "IGNORED_EVENT";
+  ownerSessionId?: string;
+};
+
 export class TaskService {
   private readonly sessionQueues = new Map<string, Promise<void>>();
   private readonly eventCompletions = new Map<string, Promise<void>>();
+  private readonly taskQueues = new Map<string, Promise<void>>();
   private readonly pendingSendByTask = new Map<string, symbol>();
 
   constructor(
-    readonly store: InMemoryStore,
+    readonly store: Store,
     readonly platforms: PlatformAdapterRegistry,
     readonly hermes: HermesDeliveryAdapter,
     readonly classifier: TaskClassifier,
   ) {}
 
-  createTask(input: {
+  async createTask(input: {
     hermesSessionId: string;
     platform: string;
     conversationId: string;
     description: string;
-  }): MessagingTask {
+  }): Promise<MessagingTask> {
     const platform = this.platforms.get(input.platform);
-    if (!this.store.getConversation(platform.platform, input.conversationId)) {
+    if (!await this.store.getConversation(platform.platform, input.conversationId)) {
       throw new ApiError(
         404,
         "CONVERSATION_NOT_FOUND",
@@ -62,13 +74,12 @@ export class TaskService {
       updatedAt: now,
       completedAt: null,
     };
-    // In-memory insertion is synchronous, so concurrent requests reserve distinct open tasks safely.
-    this.store.tasks.set(task.id, task);
+    await this.store.saveTask(task);
     return task;
   }
 
-  getTask(taskId: string): MessagingTask {
-    const task = this.store.tasks.get(taskId);
+  async getTask(taskId: string): Promise<MessagingTask> {
+    const task = await this.store.getTask(taskId);
     if (!task)
       throw new ApiError(
         404,
@@ -78,13 +89,13 @@ export class TaskService {
     return task;
   }
 
-  listTasks(filters: {
+  async listTasks(filters: {
     status?: TaskStatus;
     platform?: string;
     conversationId?: string;
     hermesSessionId?: string;
-  }): MessagingTask[] {
-    return [...this.store.tasks.values()].filter(
+  }): Promise<MessagingTask[]> {
+    return (await this.store.getTasks()).filter(
       (task) =>
         (!filters.status || task.status === filters.status) &&
         (!filters.platform || task.platform === filters.platform) &&
@@ -104,44 +115,57 @@ export class TaskService {
       description: string;
     },
   ): Promise<MessagingTask> {
-    const task = this.getTask(taskId);
     const platform = this.platforms.get(input.platform);
-    if (
-      task.platform !== platform.platform ||
-      task.conversationId !== input.conversationId
-    ) {
-      throw new ApiError(
-        400,
-        "TASK_DESTINATION_MISMATCH",
-        "The platform and conversation must match the task destination.",
-      );
-    }
-    if (task.status !== "ACTIVE") this.assertActive(task);
-
-    const previousDescription = task.description;
-    const sendToken = Symbol(task.id);
-    this.pendingSendByTask.set(task.id, sendToken);
-    task.description = input.description;
-    task.status = "WAITING_EXTERNAL_REPLY";
-    task.updatedAt = new Date().toISOString();
+    let task!: MessagingTask;
+    let previousDescription = "";
+    let sendToken!: symbol;
+    await this.serialForTask(taskId, async () => {
+      const current = await this.store.getTask(taskId);
+      if (!current) throw this.taskNotFound();
+      if (
+        current.platform !== platform.platform ||
+        current.conversationId !== input.conversationId
+      ) {
+        throw new ApiError(
+          400,
+          "TASK_DESTINATION_MISMATCH",
+          "The platform and conversation must match the task destination.",
+        );
+      }
+      if (current.status !== "ACTIVE") this.assertActive(current);
+      task = current;
+      previousDescription = current.description;
+      sendToken = Symbol(current.id);
+      this.pendingSendByTask.set(current.id, sendToken);
+      current.description = input.description;
+      current.status = "WAITING_EXTERNAL_REPLY";
+      current.updatedAt = new Date().toISOString();
+      await this.store.saveTask(current);
+    });
     try {
       await platform.sendMessage(task, input.message);
     } catch (error) {
       // A newer send can start after an immediate reply reactivates the task.
-      if (this.pendingSendByTask.get(task.id) === sendToken) {
-        this.pendingSendByTask.delete(task.id);
-        task.description = previousDescription;
-        if (task.status === "WAITING_EXTERNAL_REPLY") {
-          task.status = "ACTIVE";
-          task.updatedAt = new Date().toISOString();
+      await this.serialForTask(task.id, async () => {
+        if (this.pendingSendByTask.get(task.id) === sendToken) {
+          this.pendingSendByTask.delete(task.id);
+          const latest = await this.store.getTask(task.id);
+          if (latest) {
+            latest.description = previousDescription;
+            if (latest.status === "WAITING_EXTERNAL_REPLY") {
+              latest.status = "ACTIVE";
+              latest.updatedAt = new Date().toISOString();
+            }
+            await this.store.saveTask(latest);
+          }
         }
-      }
+      });
       throw error;
     }
     if (this.pendingSendByTask.get(task.id) === sendToken)
       this.pendingSendByTask.delete(task.id);
 
-    this.store.reserveAction({
+    await this.store.reserveAction({
       type: "MESSAGE_SENT",
       platform: task.platform,
       conversationId: task.conversationId,
@@ -150,29 +174,37 @@ export class TaskService {
       message: input.message,
       outcome: `ACCEPTED_BY_${task.platform.toUpperCase()}_PLATFORM`,
     });
-    return task;
+    return await this.getTask(task.id);
   }
 
-  completeTask(taskId: string, result: string): MessagingTask {
-    const task = this.getTask(taskId);
-    if (task.status === "COMPLETED") return task;
-    if (!isOpenTask(task.status)) this.assertActive(task);
-    task.status = "COMPLETED";
-    task.result = result;
-    task.completedAt = new Date().toISOString();
-    task.updatedAt = task.completedAt;
-    return task;
+  async completeTask(taskId: string, result: string): Promise<MessagingTask> {
+    return this.serialForTask(taskId, async () => {
+      const task = await this.store.getTask(taskId);
+      if (!task) throw this.taskNotFound();
+      if (task.status === "COMPLETED") return task;
+      if (!isOpenTask(task.status)) this.assertActive(task);
+      task.status = "COMPLETED";
+      task.result = result;
+      task.completedAt = new Date().toISOString();
+      task.updatedAt = task.completedAt;
+      await this.store.saveTask(task);
+      return task;
+    });
   }
 
-  cancelTask(taskId: string, reason: string | null): MessagingTask {
-    const task = this.getTask(taskId);
-    if (task.status === "CANCELLED") return task;
-    if (!isOpenTask(task.status)) this.assertActive(task);
-    task.status = "CANCELLED";
-    task.cancelReason = reason;
-    task.completedAt = new Date().toISOString();
-    task.updatedAt = task.completedAt;
-    return task;
+  async cancelTask(taskId: string, reason: string | null): Promise<MessagingTask> {
+    return this.serialForTask(taskId, async () => {
+      const task = await this.store.getTask(taskId);
+      if (!task) throw this.taskNotFound();
+      if (task.status === "CANCELLED") return task;
+      if (!isOpenTask(task.status)) this.assertActive(task);
+      task.status = "CANCELLED";
+      task.cancelReason = reason;
+      task.completedAt = new Date().toISOString();
+      task.updatedAt = task.completedAt;
+      await this.store.saveTask(task);
+      return task;
+    });
   }
 
   async receiveInbound(
@@ -186,7 +218,7 @@ export class TaskService {
     routingOutcome: RoutingOutcome | "IGNORED_EVENT";
     ownerSessionId?: string;
   }> {
-    const message = this.platforms.get(platform).normalizeInbound(payload);
+    const message = await this.platforms.get(platform).normalizeInbound(payload);
     if (!message)
       return {
         eventId: null,
@@ -196,17 +228,39 @@ export class TaskService {
         routingOutcome: "IGNORED_EVENT",
       };
     const deduplicationKey = `${message.platform}\u0000${message.externalMessageId}`;
-    const previous = this.store.inboundEvents.get(deduplicationKey);
-    if (previous) {
-      const completion = this.eventCompletions.get(deduplicationKey);
-      if (completion) await completion;
-      console.log(
-        `receiveInbound: duplicate event for ${message.platform} conversation ${message.conversationId} external message ${message.externalMessageId}`,
-      );
-      return this.webhookResponse(previous, true);
+    const running = this.eventCompletions.get(deduplicationKey);
+    if (running) {
+      await running;
+      const previous = await this.store.getInboundEvent(deduplicationKey);
+      if (previous) {
+        console.log(
+          `receiveInbound: duplicate event for ${message.platform} conversation ${message.conversationId} external message ${message.externalMessageId}`,
+        );
+        return this.webhookResponse(previous, true);
+      }
     }
 
-    const tasks = this.store.getOpenTasks(
+    // Defer processing one microtask so duplicate coordination is registered before
+    // the first asynchronous lookup or write begins.
+    const operation = Promise.resolve().then(() => this.processInbound(message));
+    const completion = operation.then(() => undefined, () => undefined);
+    this.eventCompletions.set(deduplicationKey, completion);
+    try {
+      return await operation;
+    } finally {
+      if (this.eventCompletions.get(deduplicationKey) === completion)
+        this.eventCompletions.delete(deduplicationKey);
+    }
+  }
+
+  private async processInbound(message: InboundMessage): Promise<WebhookResponse> {
+    const deduplicationKey = `${message.platform}\u0000${message.externalMessageId}`;
+    const previous = await this.store.getInboundEvent(deduplicationKey);
+    if (previous) return this.webhookResponse(previous, true);
+
+    await this.platforms.get(message.platform).prepareInbound?.(message);
+
+    const tasks = await this.store.getOpenTasks(
       message.platform,
       message.conversationId,
     );
@@ -217,7 +271,7 @@ export class TaskService {
     const initialRoutingOutcome: RoutingOutcome = noTask
       ? "IGNORED_NO_ACTIVE_TASK"
       : "AUTO_ROUTED";
-    const action = this.store.reserveAction({
+    const action = await this.store.reserveAction({
       type: "WEBHOOK_RECEIVED",
       platform: message.platform,
       conversationId: message.conversationId,
@@ -235,22 +289,17 @@ export class TaskService {
       outcome: initialOutcome,
       routingOutcome: initialRoutingOutcome,
     };
-    // Reserve provider deduplication before classification, owner prompting, or delivery can yield.
-    this.store.inboundEvents.set(deduplicationKey, event);
+    // Persist the provider key before classification, owner prompting, or delivery.
+    await this.store.saveInboundEvent(event);
 
     if (noTask) {
-      console.warn(
+      console.log(
         `Inbound message ${message.externalMessageId} for ${message.platform} conversation ${message.conversationId} has no open task.`,
       );
       return this.webhookResponse(event, false);
     }
 
-    const completion = this.routeInbound(event, action, tasks);
-    this.eventCompletions.set(deduplicationKey, completion);
-    await completion;
-    if (this.eventCompletions.get(deduplicationKey) === completion) {
-      this.eventCompletions.delete(deduplicationKey);
-    }
+    await this.routeInbound(event, action, tasks);
     if (
       event.outcome === "DELIVERY_FAILED" ||
       event.outcome === "OWNER_REVIEW_FAILED"
@@ -291,7 +340,7 @@ export class TaskService {
         "Selection requires a non-empty array of unique task IDs.",
       );
     }
-    const selected = input.taskIds.map((taskId) => this.getTask(taskId));
+    const selected = await Promise.all(input.taskIds.map((taskId) => this.getTask(taskId)));
     for (const task of selected) {
       if (!isOpenTask(task.status)) this.assertActive(task);
       if (
@@ -308,7 +357,7 @@ export class TaskService {
 
     const eventId = `event_${crypto.randomUUID()}`;
     const externalMessageId = `selection_${crypto.randomUUID()}`;
-    const action = this.store.reserveAction({
+    const action = await this.store.reserveAction({
       type: "WEBHOOK_RECEIVED",
       platform: input.platform,
       conversationId: input.conversationId,
@@ -317,15 +366,14 @@ export class TaskService {
       message: input.webhookMessage,
       outcome: "PENDING_HERMES",
     });
+    const conversation = await this.store.getConversation(input.platform, input.conversationId);
     const deliveries = await Promise.all(
       selected.map((task) =>
         this.deliverToTask(task.id, {
           platform: input.platform,
           conversationId: input.conversationId,
           externalMessageId,
-          senderDisplayName:
-            this.store.getConversation(input.platform, input.conversationId)
-              ?.displayName ?? input.conversationId,
+          senderDisplayName: conversation?.displayName ?? input.conversationId,
           content: input.webhookMessage,
         }),
       ),
@@ -334,6 +382,7 @@ export class TaskService {
       (result) => result.outcome === "DELIVERY_FAILED",
     );
     action.outcome = failed ? "DELIVERY_FAILED" : "DELIVERED";
+    await this.store.saveAction(action);
     return {
       eventId,
       taskIds: [...input.taskIds],
@@ -345,7 +394,7 @@ export class TaskService {
 
   private async routeInbound(
     event: InboundEvent,
-    action: ReturnType<InMemoryStore["reserveAction"]>,
+    action: ConversationAction,
     candidates: MessagingTask[],
   ): Promise<void> {
     const message = event.message;
@@ -380,6 +429,8 @@ export class TaskService {
       event.routingOutcome = "OWNER_REVIEW";
       action.taskIds = [...taskIds];
       action.outcome = "OWNER_REVIEW";
+      await this.store.saveInboundEvent(event);
+      await this.store.saveAction(action);
       try {
         event.ownerSessionId = await this.classifier.checkWithUser({
           webhookMessage: message.content,
@@ -395,6 +446,8 @@ export class TaskService {
         event.routingOutcome = "OWNER_REVIEW_FAILED";
         action.outcome = event.outcome;
       }
+      await this.store.saveInboundEvent(event);
+      await this.store.saveAction(action);
       return;
     }
 
@@ -402,6 +455,8 @@ export class TaskService {
     event.taskIds = [taskId];
     action.taskIds = [taskId];
     action.outcome = "PENDING_HERMES";
+    await this.store.saveInboundEvent(event);
+    await this.store.saveAction(action);
     const delivered = await this.deliverToTask(taskId, {
       platform: message.platform,
       conversationId: message.conversationId,
@@ -416,6 +471,8 @@ export class TaskService {
     else if (delivered.outcome === "IGNORED_TASK_CLOSED")
       event.routingOutcome = "IGNORED_TASK_CLOSED";
     else event.routingOutcome = "AUTO_ROUTED";
+    await this.store.saveInboundEvent(event);
+    await this.store.saveAction(action);
   }
 
   private async deliverToTask(
@@ -428,10 +485,10 @@ export class TaskService {
       content: string;
     },
   ): Promise<DeliveryResult> {
-    const task = this.store.tasks.get(taskId);
+    const task = await this.store.getTask(taskId);
     if (!task) return { taskId, outcome: "IGNORED_TASK_CLOSED" };
     return this.serialForSession(task.hermesSessionId, async () => {
-      const boundTask = this.store.tasks.get(taskId);
+      const boundTask = await this.store.getTask(taskId);
       if (!boundTask || !isOpenTask(boundTask.status)) {
         return { taskId, outcome: "IGNORED_TASK_CLOSED" as const };
       }
@@ -456,7 +513,7 @@ export class TaskService {
         return { taskId, outcome: "DELIVERY_FAILED" as const };
       }
 
-      this.store.reserveAction({
+      await this.store.reserveAction({
         type: "HERMES_DELIVERED",
         platform: message.platform,
         conversationId: message.conversationId,
@@ -467,10 +524,14 @@ export class TaskService {
         outcome: "DELIVERED",
         envelope: delivery.envelope,
       });
-      if (boundTask.status === "WAITING_EXTERNAL_REPLY") {
-        boundTask.status = "ACTIVE";
-        boundTask.updatedAt = new Date().toISOString();
-      }
+      await this.serialForTask(taskId, async () => {
+        const latestTask = await this.store.getTask(taskId);
+        if (latestTask?.status === "WAITING_EXTERNAL_REPLY") {
+          latestTask.status = "ACTIVE";
+          latestTask.updatedAt = new Date().toISOString();
+          await this.store.saveTask(latestTask);
+        }
+      });
       return { taskId, outcome: "DELIVERED" as const };
     });
   }
@@ -492,6 +553,31 @@ export class TaskService {
       "TASK_NOT_ACTIVE",
       `Task is ${task.status} and cannot perform this operation.`,
     );
+  }
+
+  private taskNotFound(): ApiError {
+    return new ApiError(
+      404,
+      "TASK_NOT_FOUND",
+      "The requested messaging task does not exist.",
+    );
+  }
+
+  private async serialForTask<T>(taskId: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.taskQueues.get(taskId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => current);
+    this.taskQueues.set(taskId, tail);
+    await previous;
+    try {
+      return await work();
+    } finally {
+      release();
+      if (this.taskQueues.get(taskId) === tail) this.taskQueues.delete(taskId);
+    }
   }
 
   private async serialForSession<T>(

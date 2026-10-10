@@ -5,14 +5,15 @@ import {
 } from "../hermes/http-hermes-adapter.ts";
 import { HttpTaskClassifier } from "../classification/http-task-classifier.ts";
 import { PlatformAdapterRegistry } from "../platforms/platform-adapter-registry.ts";
-import { InMemoryStore } from "../storage/store.ts";
+import { InMemoryStore } from "../storage/in-memory-store.ts";
 import { StubPlatformAdapter } from "../platforms/stub/stub-platform-adapter.ts";
 import { TaskService } from "../services/task-service.ts";
 import { UnavailableTaskClassifier } from "../classification/unavailable-task-classifier.ts";
 import { WahaPlatformAdapter } from "../platforms/waha/waha-adapter.ts";
 
-export function createServices(options: ApplicationOptions) {
+export async function createServices(options: ApplicationOptions) {
   const store = options.store ?? new InMemoryStore();
+  await store.setup();
   const overrides = new Map(
     (options.platforms ?? []).map((adapter) => [adapter.platform, adapter]),
   );

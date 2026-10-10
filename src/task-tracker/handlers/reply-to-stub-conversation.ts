@@ -5,19 +5,19 @@ import { readObject } from "../http/read-object.ts";
 import { respondToInbound } from "../http/respond-to-inbound.ts";
 import { validatePhoneNumber } from "../http/validation.ts";
 import { PLATFORM } from "../domain/platform.ts";
-import type { InMemoryStore } from "../storage/store.ts";
+import type { Store } from "../storage/store.ts";
 import type { TaskService } from "../services/task-service.ts";
 import { exactKeys, requiredString } from "../validation.ts";
 
 export function replyToStubConversationHandler(
   service: TaskService,
-  store: InMemoryStore,
+  store: Store,
 ): Handler<ApplicationEnv, "/stub/conversations/:conversationId/reply"> {
   return async (context) => {
     const conversationId = validatePhoneNumber(
       context.req.param("conversationId"),
     );
-    if (!store.getConversation(PLATFORM, conversationId)) {
+    if (!await store.getConversation(PLATFORM, conversationId)) {
       throw new ApiError(
         404,
         "CONVERSATION_NOT_FOUND",

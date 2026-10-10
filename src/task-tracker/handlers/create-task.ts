@@ -24,7 +24,7 @@ export function createTaskHandler(
     const platform = platforms.get(
       requiredString(body.platform, "platform", 100),
     );
-    const task = service.createTask({
+    const task = await service.createTask({
       hermesSessionId: requiredString(
         body.hermesSessionId,
         "hermesSessionId",

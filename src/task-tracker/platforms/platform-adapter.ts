@@ -10,5 +10,6 @@ export interface PlatformAdapter {
     task: MessagingTask,
     message: string,
   ): Promise<{ acceptedAt: string }>;
-  normalizeInbound(payload: unknown): InboundMessage | null;
+  normalizeInbound(payload: unknown): InboundMessage | null | Promise<InboundMessage | null>;
+  prepareInbound?(message: InboundMessage): Promise<void>;
 }

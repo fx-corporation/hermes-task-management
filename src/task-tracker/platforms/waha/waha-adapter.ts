@@ -5,7 +5,7 @@ import { invalidRequest } from "../../errors/invalid-request.ts";
 import type { InboundMessage } from "../../domain/inbound-message.ts";
 import type { MessagingTask } from "../../domain/messaging-task.ts";
 import { type PlatformAdapter } from "../platform-adapter.ts";
-import { InMemoryStore } from "../../storage/store.ts";
+import type { Store } from "../../storage/store.ts";
 import { isRecord, requiredString } from "../../validation.ts";
 
 import type { WahaOptions } from "./waha-options.ts";
@@ -22,7 +22,7 @@ export class WahaPlatformAdapter implements PlatformAdapter {
   private readonly lidsByPhone = new Map<string, string>();
 
   constructor(
-    private readonly store: InMemoryStore,
+    private readonly store: Store,
     private readonly options: WahaOptions,
   ) {
     const url = new URL(options.baseUrl);
@@ -52,8 +52,7 @@ export class WahaPlatformAdapter implements PlatformAdapter {
     );
     if (!Array.isArray(contacts)) throw this.providerError();
     const conversations = new Map<string, Conversation>(
-      [...this.store.conversations.values()]
-        .filter((c) => c.platform === this.platform)
+      (await this.store.listConversations(this.platform))
         .map((c) => [c.conversationId, c]),
     );
     for (const contact of contacts) {
@@ -91,7 +90,7 @@ export class WahaPlatformAdapter implements PlatformAdapter {
         conversationId,
         displayName: typeof name === "string" ? name.trim() : conversationId,
       };
-      this.store.addConversation(conversation);
+      await this.store.addConversation(conversation);
       conversations.set(conversationId, conversation);
     }
     const query = search?.trim().toLocaleLowerCase();
@@ -132,7 +131,7 @@ export class WahaPlatformAdapter implements PlatformAdapter {
     return { acceptedAt: new Date().toISOString() };
   }
 
-  normalizeInbound(body: unknown): InboundMessage | null {
+  async normalizeInbound(body: unknown): Promise<InboundMessage | null> {
     if (!isRecord(body))
       throw invalidRequest("The webhook body must be a JSON object.");
     requiredString(body.event, "event", 200);
@@ -175,23 +174,25 @@ export class WahaPlatformAdapter implements PlatformAdapter {
       throw invalidRequest(
         "WAHA payload.timestamp is outside the supported range.",
       );
-    const senderDisplayName =
-      this.store.getConversation(this.platform, conversationId)?.displayName ??
-      conversationId;
-    this.store.addConversation({
-      platform: this.platform,
-      conversationId,
-      displayName: senderDisplayName,
-    });
     return {
       platform: this.platform,
       conversationId,
       externalMessageId,
       senderId: payload.from as string,
-      senderDisplayName,
+      senderDisplayName: conversationId,
       content,
       timestamp: date.toISOString(),
     };
+  }
+
+  async prepareInbound(message: InboundMessage): Promise<void> {
+    const conversation = await this.store.getConversation(this.platform, message.conversationId);
+    message.senderDisplayName = conversation?.displayName ?? message.conversationId;
+    await this.store.addConversation({
+      platform: this.platform,
+      conversationId: message.conversationId,
+      displayName: message.senderDisplayName,
+    });
   }
 
   async readWebhook(

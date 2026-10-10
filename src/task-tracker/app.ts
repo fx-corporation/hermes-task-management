@@ -26,9 +26,9 @@ import { logWebhook } from "./http/log-webhook.ts";
 import { rawBody } from "./http/raw-body.ts";
 import { WahaPlatformAdapter } from "./platforms/waha/waha-adapter.ts";
 
-export function createApplication(options: ApplicationOptions): Application {
+export async function createApplication(options: ApplicationOptions): Promise<Application> {
   const { service, store, platforms, hermes, classifier, defaultPlatform } =
-    createServices(options);
+    await createServices(options);
   const webhookToken = (platform: Platform) =>
     options.webhookTokens?.[platform] ?? options.webhookToken;
   const app = new Hono<ApplicationEnv>({ strict: true });

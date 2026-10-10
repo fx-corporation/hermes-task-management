@@ -1,9 +1,9 @@
 import { HttpTaskClassifier } from "./http-task-classifier.ts";
-import { InMemoryStore } from "../storage/store.ts";
+import type { Store } from "../storage/store.ts";
 
 export function taskClassifierFromEnvironment(
   environment: NodeJS.ProcessEnv,
-  store: InMemoryStore,
+  store: Store,
 ): HttpTaskClassifier {
   return new HttpTaskClassifier({
     baseUrl: environment.HERMES_BASE_URL ?? "http://127.0.0.1:8643",

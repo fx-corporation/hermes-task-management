@@ -4,10 +4,10 @@ import type { ApplicationEnv } from "../application/application-env.ts";
 import { validateConversationId } from "../http/validation.ts";
 import type { PlatformAdapterRegistry } from "../platforms/platform-adapter-registry.ts";
 import type { Platform } from "../domain/platform.ts";
-import type { InMemoryStore } from "../storage/store.ts";
+import type { Store } from "../storage/store.ts";
 
 export function listConversationActionsHandler(
-  store: InMemoryStore,
+  store: Store,
   platforms: PlatformAdapterRegistry,
   defaultPlatform: Platform,
 ): Handler<ApplicationEnv, "/conversations/:conversationId/actions"> {
@@ -19,7 +19,7 @@ export function listConversationActionsHandler(
       context.req.param("conversationId"),
       platform.platform,
     );
-    if (!store.getConversation(platform.platform, conversationId)) {
+    if (!await store.getConversation(platform.platform, conversationId)) {
       throw new ApiError(
         404,
         "CONVERSATION_NOT_FOUND",
@@ -30,7 +30,7 @@ export function listConversationActionsHandler(
       success: true,
       platform: platform.platform,
       conversationId,
-      actions: store.getConversationActions(platform.platform, conversationId),
+      actions: await store.getConversationActions(platform.platform, conversationId),
     });
   };
 }

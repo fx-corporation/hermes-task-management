@@ -14,6 +14,8 @@ services:
       - TASK_CLASSIFIER_BASE_URL=http://ollama:11434/v1
       - TASK_CLASSIFIER_API_KEY=${TASK_CLASSIFIER_API_KEY:-ollama}
       - TASK_CLASSIFIER_MODEL=${TASK_CLASSIFIER_MODEL:-gemma4:e4b}
+      - TASK_STORAGE=${TASK_STORAGE:-sqlite}
+      - SQLITE_FILE_PATH=${SQLITE_FILE_PATH:-./data/task-tracker.sqlite}
     depends_on:
       hermes-stub:
         condition: service_healthy
@@ -23,6 +25,8 @@ services:
       - .env
     ports:
       - '9005:9005'
+    volumes:
+      - ./data:/app/data
 
   hermes-stub:
     build:

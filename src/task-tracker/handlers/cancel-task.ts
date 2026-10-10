@@ -13,7 +13,7 @@ export function cancelTaskHandler(
     exactKeys(body, [], ["reason"]);
     const reason =
       body.reason === undefined ? null : requiredString(body.reason, "reason");
-    const task = service.cancelTask(taskId, reason);
+    const task = await service.cancelTask(taskId, reason);
     return context.json({ success: true, taskId, status: task.status });
   };
 }

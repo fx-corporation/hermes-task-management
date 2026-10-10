@@ -13,6 +13,7 @@ FROM oven/bun:1.4.2-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production HOST=0.0.0.0 PORT=9005
 COPY --from=build --chown=bun:bun /app/dist/server.js ./server.js
+RUN mkdir -p /app/data && chown bun:bun /app/data
 USER bun
 EXPOSE 9005
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \

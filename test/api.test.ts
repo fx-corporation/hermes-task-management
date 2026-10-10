@@ -4,19 +4,25 @@ import { createApplication } from "../src/task-tracker/app.ts";
 import { InMemoryHermesAdapter } from "../src/task-tracker/adapters.ts";
 import type { HermesDelivery } from "../src/task-tracker/domain.ts";
 import { HttpHermesAdapter } from "../src/task-tracker/http-hermes-adapter.ts";
+import { InMemoryStore } from "../src/task-tracker/store.ts";
 import { startServer } from "../src/task-tracker/server.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Application } from "../src/task-tracker/app.ts";
 
 const API_TOKEN = "test-api-token";
 const WEBHOOK_TOKEN = "test-webhook-token";
 const DENTAL = "+12025550101";
 
-function setup() {
-  const app = createApplication({ apiToken: API_TOKEN, webhookToken: WEBHOOK_TOKEN, hermes: new InMemoryHermesAdapter() });
-  return { app, hermes: app.hermes as InMemoryHermesAdapter };
+async function setup() {
+  const store = new InMemoryStore();
+  const app = await createApplication({ apiToken: API_TOKEN, webhookToken: WEBHOOK_TOKEN, store, hermes: new InMemoryHermesAdapter() });
+  return { app, store, hermes: app.hermes as InMemoryHermesAdapter };
 }
 
 function request(
-  app: ReturnType<typeof createApplication>,
+  app: Application,
   path: string,
   options: { method?: string; token?: string; webhook?: boolean; body?: unknown } = {},
 ) {
@@ -35,7 +41,7 @@ async function json(response: Response): Promise<Record<string, any>> {
   return await response.json() as Record<string, any>;
 }
 
-async function createTask(app: ReturnType<typeof createApplication>, overrides: Record<string, unknown> = {}) {
+async function createTask(app: Application, overrides: Record<string, unknown> = {}) {
   return request(app, "/tasks", {
     method: "POST",
     body: {
@@ -50,7 +56,7 @@ async function createTask(app: ReturnType<typeof createApplication>, overrides: 
 
 describe("task management API", () => {
   test("runs the complete simulated appointment conversation", async () => {
-    const { app, hermes } = setup();
+    const { app, hermes } = await setup();
     const conversations = await json(await request(app, "/conversations?platform=stub&search=dental"));
     expect(conversations.conversations).toEqual([
       { platform: "stub", conversationId: DENTAL, displayName: "Example Dental" },
@@ -93,7 +99,7 @@ describe("task management API", () => {
   });
 
   test("requires separate bearer tokens and reports structured errors", async () => {
-    const { app } = setup();
+    const { app } = await setup();
     const unauthorized = await json(await request(app, "/tasks", { token: "wrong" }));
     expect(unauthorized).toMatchObject({ success: false, error: { code: "UNAUTHORIZED" } });
     expect((await request(app, "/tasks", { token: "wrong" })).status).toBe(401);
@@ -111,7 +117,7 @@ describe("task management API", () => {
   });
 
   test("rejects unknown contacts, duplicate contacts, and recipient overrides", async () => {
-    const { app } = setup();
+    const { app } = await setup();
     expect((await createTask(app, { conversationId: "+12025550999" })).status).toBe(404);
     expect((await request(app, "/stub/conversations", {
       body: { conversationId: DENTAL, displayName: "Duplicate" },
@@ -128,7 +134,7 @@ describe("task management API", () => {
   });
 
   test("validates malformed JSON, unknown tasks, and contact registration", async () => {
-    const { app } = setup();
+    const { app } = await setup();
     const malformed = await fetchApplication(app, new Request("http://localhost/tasks", {
       method: "POST",
       headers: { authorization: `Bearer ${API_TOKEN}`, "content-type": "application/json" },
@@ -149,19 +155,19 @@ describe("task management API", () => {
   });
 
   test("reports a stub send failure and leaves the task active", async () => {
-    const { app } = setup();
+    const { app, store } = await setup();
     const task = (await json(await createTask(app))).task;
-    app.store.conversations.clear();
+    store.conversations.clear();
     const failed = await request(app, `/tasks/${task.id}`, { body: { platform: "stub", conversationId: DENTAL, message: "Hello", description: "updated description" } });
     expect(failed.status).toBe(502);
     expect((await json(failed)).error.code).toBe("MESSAGE_SEND_FAILED");
-    expect(app.service.getTask(task.id).status).toBe("ACTIVE");
-    expect(app.service.getTask(task.id).description).toBe("Book a dental appointment with the office. Latest state: appointment not confirmed.");
-    expect(app.store.getConversationActions("stub", DENTAL)).toHaveLength(0);
+    expect((await app.service.getTask(task.id)).status).toBe("ACTIVE");
+    expect((await app.service.getTask(task.id)).description).toBe("Book a dental appointment with the office. Latest state: appointment not confirmed.");
+    expect(await app.store.getConversationActions("stub", DENTAL)).toHaveLength(0);
   });
 
   test("allows multiple open tasks and preserves terminal lifecycle rules", async () => {
-    const { app } = setup();
+    const { app } = await setup();
     const first = (await json(await createTask(app))).task;
     const second = (await json(await createTask(app, { hermesSessionId: "second-session" }))).task;
     expect(second.id).not.toBe(first.id);
@@ -176,14 +182,14 @@ describe("task management API", () => {
   });
 
   test("allows concurrent creation for the same conversation", async () => {
-    const { app } = setup();
+    const { app } = await setup();
     const attempts = await Promise.all([createTask(app), createTask(app)]);
     expect(attempts.map((response) => response.status)).toEqual([201, 201]);
     expect((await json(await request(app, "/tasks?platform=stub&conversationId=" + encodeURIComponent(DENTAL)))).tasks).toHaveLength(2);
   });
 
   test("deduplicates webhook retries and ignores replies when no task is open", async () => {
-    const { app, hermes } = setup();
+    const { app, hermes } = await setup();
     const task = (await json(await createTask(app))).task;
     const payload = { conversationId: DENTAL, externalMessageId: "provider-message-42", message: "Confirmed." };
     const first = await json(await request(app, "/webhooks/stub", { method: "POST", webhook: true, body: payload }));
@@ -213,7 +219,7 @@ describe("task management API", () => {
         active -= 1;
       },
     };
-    const app = createApplication({ apiToken: API_TOKEN, webhookToken: WEBHOOK_TOKEN, hermes });
+    const app = await createApplication({ apiToken: API_TOKEN, webhookToken: WEBHOOK_TOKEN, hermes });
     const first = (await json(await createTask(app, { hermesSessionId: "shared-session" }))).task;
     const second = (await json(await createTask(app, {
       hermesSessionId: "shared-session", conversationId: "+12025550102",
@@ -246,7 +252,7 @@ describe("task management API", () => {
         delivered.push(delivery.externalMessageId);
       },
     };
-    const app = createApplication({ apiToken: API_TOKEN, webhookToken: WEBHOOK_TOKEN, hermes });
+    const app = await createApplication({ apiToken: API_TOKEN, webhookToken: WEBHOOK_TOKEN, hermes });
     const first = (await json(await createTask(app, { hermesSessionId: "queued-session" }))).task;
     const second = (await json(await createTask(app, {
       hermesSessionId: "queued-session", conversationId: "+12025550102",
@@ -261,7 +267,7 @@ describe("task management API", () => {
     } });
     // Allow Fetch body reading to finish before closing the task already bound to the reply.
     await new Promise<void>(resolve => setImmediate(resolve));
-    expect(app.store.inboundEvents.get("stub\u0000queued")?.taskIds).toEqual([second.id]);
+    expect((await app.store.getInboundEvent("stub\u0000queued"))?.taskIds).toEqual([second.id]);
     await request(app, `/tasks/${second.id}/complete`, { body: { result: "Closed while queued" } });
     releaseFirst();
 
@@ -282,7 +288,7 @@ describe("task management API", () => {
         await hold;
       },
     };
-    const app = createApplication({ apiToken: API_TOKEN, webhookToken: WEBHOOK_TOKEN, hermes });
+    const app = await createApplication({ apiToken: API_TOKEN, webhookToken: WEBHOOK_TOKEN, hermes });
     await createTask(app);
     const body = { conversationId: DENTAL, externalMessageId: "concurrent-retry", message: "Reply" };
     const firstPromise = request(app, "/webhooks/stub", { method: "POST", webhook: true, body });
@@ -296,11 +302,14 @@ describe("task management API", () => {
   });
 
   test("starts a live Hono server and serves health and authenticated routes", async () => {
-    const { server, app } = startServer({
+    const directory = mkdtempSync(join(tmpdir(), "hermes-task-tracker-server-"));
+    const { server, app, stop } = await startServer({
       MESSAGING_TASK_API_TOKEN: API_TOKEN,
       STUB_WEBHOOK_TOKEN: WEBHOOK_TOKEN,
       HERMES_API_KEY: "test-hermes-key",
       PORT: "0",
+      TASK_STORAGE: "sqlite",
+      SQLITE_FILE_PATH: join(directory, "nested", "test.sqlite"),
     });
     const serverUrl = server.url;
     try {
@@ -309,8 +318,8 @@ describe("task management API", () => {
       const conversations = await fetch(new URL("/conversations", serverUrl), {
         headers: { authorization: `Bearer ${API_TOKEN}` },
       });
-      expect((await json(conversations)).conversations).toHaveLength(2);
-      expect(app.store.conversations.size).toBe(2);
+      expect((await json(conversations)).conversations).toHaveLength(0);
+      expect(await app.store.listConversations()).toHaveLength(0);
       expect(app.hermes).toBeInstanceOf(HttpHermesAdapter);
       const oversized = await fetch(new URL("/tasks", serverUrl), {
         method: "POST", headers: { authorization: `Bearer ${API_TOKEN}`, "content-type": "application/json" },
@@ -322,12 +331,13 @@ describe("task management API", () => {
       expect(head.status).toBe(200);
       expect(await head.text()).toBe("");
     } finally {
-      await server.stop(true);
+      await stop(true);
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 
   test("keeps Hono parsing and routing errors in the API error format", async () => {
-    const { app } = setup();
+    const { app } = await setup();
     for (const path of ["/missing", "/Tasks", "/tasks/"]) {
       const response = await request(app, path);
       expect(response.status).toBe(404);
@@ -358,7 +368,7 @@ describe("task management API", () => {
   });
 
   test("returns structured errors for rejected asynchronous Hono handlers", async () => {
-    const app = createApplication({
+    const app = await createApplication({
       apiToken: API_TOKEN, webhookToken: WEBHOOK_TOKEN,
       hermes: new InMemoryHermesAdapter(),
       platform: {
@@ -376,11 +386,11 @@ describe("task management API", () => {
   });
 
   test("starts a fresh application with only its fictional seed contacts", async () => {
-    const first = setup().app;
+    const first = (await setup()).app;
     await request(first, "/stub/conversations", {
       body: { conversationId: "+12025550103", displayName: "Temporary Test Contact" },
     });
-    const second = setup().app;
+    const second = (await setup()).app;
     expect((await json(await request(second, "/conversations"))).conversations).toHaveLength(2);
   });
 });

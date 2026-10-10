@@ -10,12 +10,12 @@ import { fetchApplication } from "./helpers.ts";
 const CONTACT = "+12025550101";
 const MESSAGE = "Tuesday at 3 PM is available.";
 
-function createTasks(store: InMemoryStore, count = 2, session = (index: number) => `session-${index}`) {
-  const app = createApplication({ apiToken: "api", webhookToken: "hook", store, hermes: new InMemoryHermesAdapter() });
-  const tasks = Array.from({ length: count }, (_, index) => app.service.createTask({
+async function createTasks(store: InMemoryStore, count = 2, session = (index: number) => `session-${index}`) {
+  const app = await createApplication({ apiToken: "api", webhookToken: "hook", store, hermes: new InMemoryHermesAdapter() });
+  const tasks = await Promise.all(Array.from({ length: count }, (_, index) => app.service.createTask({
     platform: "stub", conversationId: CONTACT, hermesSessionId: session(index),
     description: `Appointment follow-up ${index + 1}. Latest state: waiting for a time confirmation.`,
-  }));
+  })));
   return { app, tasks };
 }
 
@@ -37,7 +37,7 @@ const classifyInput = { webhookMessage: MESSAGE, platform: "stub" as const, conv
 
 test("classifier skips one-task conversations and routes independent threshold scores", async () => {
   const store = new InMemoryStore();
-  const { tasks } = createTasks(store, 1);
+  const { tasks } = await createTasks(store, 1);
   let calls = 0;
   const direct = new HttpTaskClassifier({
     baseUrl: "http://hermes.test", apiKey: "key", trackerUrl: "http://tracker.test", store,
@@ -47,7 +47,7 @@ test("classifier skips one-task conversations and routes independent threshold s
   expect(calls).toBe(0);
 
   const manyStore = new InMemoryStore();
-  const { tasks: many } = createTasks(manyStore);
+  const { tasks: many } = await createTasks(manyStore);
   const { classifier, requests } = classifierFor(manyStore, { scores: [
     { taskId: many[0]!.id, confidence: 0.8 },
     { taskId: many[1]!.id, confidence: 0.79 },
@@ -64,7 +64,7 @@ test("classifier skips one-task conversations and routes independent threshold s
 
 test("multiple matches and no threshold matches both require owner review of candidates", async () => {
   const store = new InMemoryStore();
-  const { tasks } = createTasks(store);
+  const { tasks } = await createTasks(store);
   const multiple = classifierFor(store, { scores: tasks.map(task => ({ taskId: task.id, confidence: 0.8 })) });
   expect(await multiple.classifier.classify(classifyInput)).toEqual(tasks.map(task => task.id));
   const none = classifierFor(store, { scores: tasks.map(task => ({ taskId: task.id, confidence: 0.79 })) });
@@ -73,7 +73,7 @@ test("multiple matches and no threshold matches both require owner review of can
 
 test("missing, duplicate, unknown, out-of-range, and malformed scores fall back to every open task", async () => {
   const store = new InMemoryStore();
-  const { tasks } = createTasks(store);
+  const { tasks } = await createTasks(store);
   const errors: unknown[][] = [];
   const originalError = console.error;
   console.error = (...args: unknown[]) => { errors.push(args); };
@@ -111,11 +111,11 @@ test("owner session is created before its prompt and duplicate webhooks do not r
   });
   try {
     const classifier = new HttpTaskClassifier({ baseUrl: stub.url.toString(), apiKey: "route-key", trackerUrl: "http://task-tracker:9005", store });
-    const app = createApplication({ apiToken: "api", webhookToken: "hook", store, hermes: new InMemoryHermesAdapter(), taskClassifier: classifier });
-    const tasks = [0, 1].map(index => app.service.createTask({
+    const app = await createApplication({ apiToken: "api", webhookToken: "hook", store, hermes: new InMemoryHermesAdapter(), taskClassifier: classifier });
+    const tasks = await Promise.all([0, 1].map(index => app.service.createTask({
       platform: "stub", conversationId: CONTACT, hermesSessionId: `work-${index}`,
       description: `Appointment task ${index + 1}: confirm a different date and update the owner.`,
-    }));
+    })));
     // Deliberately provide malformed fixture scores: safe fallback must show every candidate to the owner.
     const inbound = { conversationId: CONTACT, externalMessageId: "owner-review-1", message: MESSAGE };
     const first = await app.service.receiveInbound("stub", inbound);
@@ -155,13 +155,13 @@ test("selection validates every task, delivers all choices in order, reports par
       expect(delivery.envelope).toContain("untrusted external content");
     },
   };
-  const app = createApplication({ apiToken: "api", webhookToken: "hook", hermes, taskClassifier: {
+  const app = await createApplication({ apiToken: "api", webhookToken: "hook", hermes, taskClassifier: {
     async classify() { return []; }, async checkWithUser() { return "owner"; },
   } });
-  const tasks = [0, 1, 2].map(index => app.service.createTask({
+  const tasks = await Promise.all([0, 1, 2].map(index => app.service.createTask({
     platform: "stub", conversationId: CONTACT, hermesSessionId: "shared-owner-session",
     description: `Choice ${index + 1} description`,
-  }));
+  })));
   const call = async (body: unknown) => fetchApplication(app, new Request("http://localhost/tasks/selection", {
     method: "POST", headers: { authorization: "Bearer api", "content-type": "application/json" }, body: JSON.stringify(body),
   }));
@@ -169,7 +169,7 @@ test("selection validates every task, delivers all choices in order, reports par
   expect((await call({ ...base, taskIds: [tasks[0]!.id, tasks[0]!.id] })).status).toBe(400);
   expect((await call({ ...base, taskIds: [tasks[0]!.id, "missing"] })).status).toBe(404);
   expect((await call({ ...base, platform: "waha", conversationId: "12025550101@lid" })).status).toBe(400);
-  app.service.completeTask(tasks[2]!.id, "Closed");
+  await app.service.completeTask(tasks[2]!.id, "Closed");
   expect((await call({ ...base, taskIds: [tasks[0]!.id, tasks[2]!.id] })).status).toBe(409);
   expect(delivered).toHaveLength(0);
 
@@ -194,7 +194,7 @@ test("selection validates every task, delivers all choices in order, reports par
     { taskId: tasks[1]!.id, outcome: "DELIVERY_FAILED" },
   ]);
   expect(maxActive).toBe(1);
-  expect(app.store.getConversationActions("stub", CONTACT).filter(action => action.type === "HERMES_DELIVERED")).toHaveLength(3);
+  expect((await app.store.getConversationActions("stub", CONTACT)).filter(action => action.type === "HERMES_DELIVERED")).toHaveLength(3);
 
   const retryResponse = await call(base);
   expect(retryResponse.status).toBe(502);
@@ -210,7 +210,7 @@ test("a selected task that closes while queued is skipped without rerouting", as
   const firstStarted = new Promise<void>(resolve => { markFirstStarted = resolve; });
   const holdFirst = new Promise<void>(resolve => { releaseFirst = resolve; });
   const seen: string[] = [];
-  const app = createApplication({ apiToken: "api", webhookToken: "hook", hermes: {
+  const app = await createApplication({ apiToken: "api", webhookToken: "hook", hermes: {
     async deliver(delivery) {
       if (delivery.taskId === firstId) {
         markFirstStarted();
@@ -219,12 +219,12 @@ test("a selected task that closes while queued is skipped without rerouting", as
       seen.push(delivery.taskId);
     },
   }, taskClassifier: { async classify() { return []; }, async checkWithUser() { return "owner"; } } });
-  const first = app.service.createTask({ platform: "stub", conversationId: CONTACT, hermesSessionId: "ordered", description: "First" });
-  const second = app.service.createTask({ platform: "stub", conversationId: CONTACT, hermesSessionId: "ordered", description: "Second" });
+  const first = await app.service.createTask({ platform: "stub", conversationId: CONTACT, hermesSessionId: "ordered", description: "First" });
+  const second = await app.service.createTask({ platform: "stub", conversationId: CONTACT, hermesSessionId: "ordered", description: "Second" });
   const firstId = first.id;
   const pending = app.service.selectTasks({ webhookMessage: MESSAGE, platform: "stub", conversationId: CONTACT, taskIds: [first.id, second.id] });
   await firstStarted;
-  app.service.completeTask(second.id, "Closed while in queue");
+  await app.service.completeTask(second.id, "Closed while in queue");
   releaseFirst();
   const result = await pending;
   expect(result.deliveries).toEqual([
@@ -257,17 +257,17 @@ test("a classifier-selected webhook task that closes in the session queue is not
     async classify() { markTargetRoutingStarted(); return [selectedTaskId]; },
     async checkWithUser() { return "owner"; },
   };
-  const app = createApplication({ apiToken: "api", webhookToken: "hook", store, hermes, taskClassifier: classifier });
-  const blocker = app.service.createTask({ platform: "stub", conversationId: "+12025550102", hermesSessionId: "shared-queue", description: "Queue blocker" });
-  const selected = app.service.createTask({ platform: "stub", conversationId: CONTACT, hermesSessionId: "shared-queue", description: "Likely target" });
-  const alternate = app.service.createTask({ platform: "stub", conversationId: CONTACT, hermesSessionId: "alternate-session", description: "Different task" });
+  const app = await createApplication({ apiToken: "api", webhookToken: "hook", store, hermes, taskClassifier: classifier });
+  const blocker = await app.service.createTask({ platform: "stub", conversationId: "+12025550102", hermesSessionId: "shared-queue", description: "Queue blocker" });
+  const selected = await app.service.createTask({ platform: "stub", conversationId: CONTACT, hermesSessionId: "shared-queue", description: "Likely target" });
+  const alternate = await app.service.createTask({ platform: "stub", conversationId: CONTACT, hermesSessionId: "alternate-session", description: "Different task" });
   selectedTaskId = selected.id;
 
   const blockerDelivery = app.service.receiveInbound("stub", { conversationId: blocker.conversationId, externalMessageId: "blocker", message: "Hold queue" });
   await blockerStarted;
   const queuedReply = app.service.receiveInbound("stub", { conversationId: CONTACT, externalMessageId: "queued-target", message: MESSAGE });
   await targetRoutingStarted;
-  app.service.completeTask(selected.id, "Closed before delivery");
+  await app.service.completeTask(selected.id, "Closed before delivery");
   releaseBlocker();
   await blockerDelivery;
   const result = await queuedReply;
@@ -305,15 +305,15 @@ test("description is visible to routing during an in-flight send and send failur
   const hermes = new InMemoryHermesAdapter();
   const classifier: TaskClassifier = {
     async classify(input) {
-      descriptionsSeen = store.getOpenTasks(input.platform, input.conversationId).map(task => task.description);
+      descriptionsSeen = (await store.getOpenTasks(input.platform, input.conversationId)).map(task => task.description);
       return [firstId];
     },
     async checkWithUser() { return "owner"; },
   };
-  const app = createApplication({ apiToken: "api", webhookToken: "hook", store, platform: adapter, hermes, taskClassifier: classifier });
-  const first = app.service.createTask({ platform: "stub", conversationId: CONTACT, hermesSessionId: "task-one", description: "Original task context" });
+  const app = await createApplication({ apiToken: "api", webhookToken: "hook", store, platform: adapter, hermes, taskClassifier: classifier });
+  const first = await app.service.createTask({ platform: "stub", conversationId: CONTACT, hermesSessionId: "task-one", description: "Original task context" });
   firstId = first.id;
-  app.service.createTask({ platform: "stub", conversationId: CONTACT, hermesSessionId: "task-two", description: "Second task context" });
+  await app.service.createTask({ platform: "stub", conversationId: CONTACT, hermesSessionId: "task-two", description: "Second task context" });
   const send = app.service.sendMessage(first.id, {
     platform: "stub", conversationId: CONTACT, message: "Are you available Tuesday?", description: "Updated context before provider send: Tuesday was offered.",
   }).catch(error => error);

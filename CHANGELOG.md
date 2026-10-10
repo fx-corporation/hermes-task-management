@@ -9,6 +9,58 @@ Repository-wide instructions are in [AGENTS.md](AGENTS.md).
 
 ## Unreleased
 
+### 2026-10-10 — Add async MikroORM SQLite storage and deployment configuration
+
+- **Agent:** Codex
+- **Changes:** Introduced the asynchronous `Store` interface in
+  `src/task-tracker/storage/store.ts`, moved `InMemoryStore` into its own file,
+  and added `MikroOrmStore`, entity definitions, a bundled initial migration,
+  and environment-based storage selection under `src/task-tracker/storage/`.
+  SQLite stores conversations, tasks, inbound events, and conversation actions,
+  including insertion order, provider-message uniqueness, JSON event data, and
+  database-assigned action sequences. Setup creates parent directories, applies
+  migrations, and rejects legacy SQLite schemas without deleting their data.
+  Updated `src/task-tracker/server.ts` to default to SQLite through
+  `TASK_STORAGE` and `SQLITE_FILE_PATH`, await initialization, and close storage
+  during shutdown or startup failure. Memory storage remains selectable, and
+  programmatic application creation defaults to memory unless a store is supplied.
+  Updated `src/task-tracker/app.ts` and callers under
+  `src/task-tracker/{application,classification,handlers,platforms,services}/`
+  to await storage operations and explicitly persist state changes. Added
+  per-task transition queues, coordinated duplicate webhooks before storage
+  lookups, and separated inbound normalization from conversation preparation.
+  Updated public storage exports in `src/task-tracker/store.ts`.
+  Added MikroORM/Kysely dependencies in `package.json` and `bun.lock`;
+  configured storage settings and the data bind mount in `docker-compose.yaml`;
+  created the runtime data directory in `src/task-tracker/Dockerfile`; and
+  excluded local data through `.gitignore` and `.dockerignore`.
+  Added `test/storage.test.ts` for both store implementations, migrations,
+  persistence, task workflows, and environment configuration. Adapted
+  `test/{api,hermes-ui,hermes,platform-routing,task-routing,waha}.test.ts` for
+  async APIs and storage access. Documented storage, migrations, deployment,
+  and async programmatic usage in `README.md`. Consolidated the current
+  uncommitted changes and validation into this single `CHANGELOG.md` record.
+- **Why:** Persist task state and webhook history across server restarts,
+  isolate data access behind a replaceable interface, and use a maintained ORM
+  while preserving task lifecycle rules and delivery ordering. Keep deployment,
+  documentation, tests, and the pending changelog aligned with the full change.
+- **Validation:** Earlier implementation validation recorded passing
+  `bun run typecheck`, `bun run test` (51 tests, 451 assertions),
+  `bun run build`, `docker compose config --quiet`, and
+  `docker compose build task-tracker`. It also recorded successful fresh
+  migrations and health, contact-creation, task-creation, and task-listing smoke
+  checks for the Bun bundle and Docker image. During review, independently ran
+  `bun test test/storage.test.ts` (6 tests, 55 assertions) and `bun run test`
+  (51 tests, 451 assertions); both passed. Targeted reproductions found known
+  limitations: persisted `PENDING_HERMES` events are skipped on retry after
+  reopening SQLite; concurrent first-time contact writes can fail with unique
+  constraints; phone-to-LID mappings disappear when the WAHA adapter restarts;
+  and a root-owned mounted data directory prevents the UID 1000 Docker runtime
+  from opening SQLite (`SQLITE_CANTOPEN`). These issues remain unresolved.
+  For this changelog consolidation, verified committed changelog history is
+  unchanged and `git diff --check` passes; application tests were not rerun
+  because only changelog text changed.
+
 ### 2026-10-05 — Migrate to Hono, add task selection, organize code, and fix Docker tests
 
 - **Agent:** Codex

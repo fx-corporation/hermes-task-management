@@ -1,6 +1,6 @@
 # Hermes Task Management API
 
-A small [Hono](https://hono.dev/) API written in TypeScript for managing multiple delegated messaging tasks per platform/contact pair. The server runs on Bun with Hono routing and middleware, an in-memory task registry, a registry containing both stub and WAHA messaging adapters, Ollama classification, and HTTP Hermes delivery. Each task has a Hermes-maintained description with its context and latest state. Stub tasks send no external messages; WAHA tasks send real WhatsApp messages.
+A small [Hono](https://hono.dev/) API written in TypeScript for managing multiple delegated messaging tasks per platform/contact pair. The server runs on Bun with Hono routing and middleware, SQLite persistence by default, a registry containing both stub and WAHA messaging adapters, Ollama classification, and HTTP Hermes delivery. Each task has a Hermes-maintained description with its context and latest state. Stub tasks send no external messages; WAHA tasks send real WhatsApp messages.
 
 ## Requirements and start
 
@@ -21,9 +21,9 @@ The stub logs every request (method, URL, headers, and complete body), including
 
 For multiple open tasks on one contact, the task tracker scores candidates through the OpenAI-compatible chat-completions API. Compose connects this classifier to the local Ollama ROCm service with `TASK_CLASSIFIER_MODEL` defaulting to `gemma4:e4b`; pull the model once after starting Compose. `TASK_CLASSIFIER_THRESHOLD` defaults to `0.80`. A single confident match receives the reply directly; multiple matches, no confident match, or a model error starts an owner review session in Hermes.
 
-The server listens on `http://127.0.0.1:9005`. Set `PORT` to change the port. Bun's `--watch` mode restarts the server during development. Run `bun run build` to bundle the Hono server into `dist/server.js`, then `bun dist/server.js` to run the bundle. Run `bun run typecheck` and `bun run test` to check the implementation.
+The server listens on `http://127.0.0.1:9005`. Set `PORT` to change the port. `TASK_STORAGE` selects `sqlite` (the default) or `memory`; `SQLITE_FILE_PATH` selects the SQLite file and defaults to `./data/task-tracker.sqlite`, relative to the working directory. MikroORM applies versioned migrations at startup and creates the parent directory as needed. Existing databases made with the earlier handwritten SQLite schema are rejected with instructions; choose a new file or recreate the database. For example, set `TASK_STORAGE=memory` to use temporary in-memory state, or set `SQLITE_FILE_PATH=/var/lib/hermes/tasks.sqlite` to choose a different persistent database file. Bun's `--watch` mode restarts the server during development. Run `bun run build` to bundle the Hono server into `dist/server.js`, then `bun dist/server.js` to run the bundle. Run `bun run typecheck` and `bun run test` to check the implementation.
 
-Programmatic callers can pass Web `Request` objects to `createApplication(options).app.fetch(request)` or `createHermesStubApplication(options).fetch(request)`. `startServer()` and `startHermesStub()` use `Bun.serve`; their server instances expose `url` and `stop()` for address discovery and shutdown.
+Programmatic callers can pass Web `Request` objects to `(await createApplication(options)).app.fetch(request)` or `createHermesStubApplication(options).fetch(request)`. `createApplication()` and `startServer()` are asynchronous because storage setup and migrations finish before they resolve. `startServer()` and `startHermesStub()` use `Bun.serve`; their server instances expose `url` and `stop()` for address discovery and shutdown. Storage operations on the `Store` interface are asynchronous for both SQLite and memory backends.
 
 `GET /health` is public. Every other endpoint uses `Authorization: Bearer …`; task, contact, and simulation endpoints require `MESSAGING_TASK_API_TOKEN`, and `POST /webhooks/stub` requires the separate `STUB_WEBHOOK_TOKEN`.
 
@@ -38,7 +38,7 @@ Task-tracker definitions use one file per class or interface and are grouped by 
 | `hermes/` | Hermes delivery types and HTTP/in-memory delivery adapters |
 | `classification/` | Reply-routing classifiers, their inputs/options, and environment configuration |
 | `services/` | Task lifecycle, inbound routing, and delivery results |
-| `storage/` | In-memory conversations, tasks, events, and action history |
+| `storage/` | Shared asynchronous store interface, in-memory store, MikroORM entities and migrations, and SQLite environment configuration |
 | `application/` | Application types, options, and service construction |
 | `handlers/` | One handler file per HTTP endpoint |
 | `http/` | Authentication, body parsing, validation, logging, and error responses |
@@ -48,11 +48,16 @@ Task-tracker definitions use one file per class or interface and are grouped by 
 
 ## Walkthrough
 
-The server starts with two fictional contacts: Example Dental (`+12025550101`) and Sample Plumbing (`+12025550102`). Stub contacts use canonical phone numbers (`+` followed by 8–15 digits). WAHA contacts use numeric LIDs ending in `@lid`. Encode `+` as `%2B` when it appears in a URL path.
+The in-memory store starts with two fictional contacts: Example Dental (`+12025550101`) and Sample Plumbing (`+12025550102`). SQLite starts empty, so add a stub contact before following this walkthrough. Stub contacts use canonical phone numbers (`+` followed by 8–15 digits). WAHA contacts use numeric LIDs ending in `@lid`. Encode `+` as `%2B` when it appears in a URL path.
 
 ```sh
 API=http://127.0.0.1:9005
 AUTH="Authorization: Bearer $MESSAGING_TASK_API_TOKEN"
+
+# SQLite starts empty. Add a contact for the walkthrough.
+curl -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"conversationId":"+12025550101","displayName":"Example Dental"}' \
+  "$API/stub/conversations"
 
 # Find a contact.
 curl -H "$AUTH" "$API/conversations?platform=stub&search=dental"
@@ -117,7 +122,7 @@ Responses use `{ "success": true, ... }`; failures use `{ "success": false, "err
 
 ## V1 boundary
 
-All state, including contacts added at runtime, tasks, actions, and deduplication keys, is held in memory and disappears on restart. The running server sends replies to Hermes over HTTP. Programmatic `createApplication` calls also default to `HttpHermesAdapter`, using the Hermes environment variables. Supply `hermesOptions` for explicit HTTP configuration or `hermes` to inject an adapter for tests.
+The running server persists contacts, tasks, actions, and webhook deduplication records in SQLite through MikroORM by default; set `TASK_STORAGE=memory` for process-local state that disappears on restart. Versioned migrations run at startup. Programmatic `createApplication` calls default to `InMemoryStore` unless a store is injected. The store interface keeps task services independent of the database driver; changing to another SQL driver will still require driver configuration, migrations, and data transfer. The running server sends replies to Hermes over HTTP. Programmatic calls also default to `HttpHermesAdapter`, using the Hermes environment variables. Supply `hermesOptions` for explicit HTTP configuration or `hermes` to inject an adapter for tests.
 
 ## Docker
 
@@ -130,9 +135,9 @@ docker compose up -d --build task-tracker
 curl http://127.0.0.1:9005/health
 ```
 
-Compose builds the stub from [its Dockerfile](src/hermes-stub/Dockerfile), waits for its health check, and connects the task tracker to `http://hermes-stub:8643` by default. View all stub requests with `docker compose logs -f hermes-stub`. Set `HERMES_BASE_URL` and `HERMES_API_KEY` in the root `.env` to target a real Hermes gateway instead.
+Compose builds the stub from [its Dockerfile](src/hermes-stub/Dockerfile), waits for its health check, and connects the task tracker to `http://hermes-stub:8643` by default. The task tracker's SQLite file lives under `/app/data`, bind-mounted to the repository's `data/` directory. Set `TASK_STORAGE=memory` in `.env` for non-persistent state, or set `SQLITE_FILE_PATH` to another path under `/app/data`. View all stub requests with `docker compose logs -f hermes-stub`. Set `HERMES_BASE_URL` and `HERMES_API_KEY` in the root `.env` to target a real Hermes gateway instead.
 
-Run `docker compose up -d --build` to start the app, Hermes stub, WAHA, and Ollama ROCm. Pull the configured classifier model once with `docker compose exec ollama ollama pull gemma4:e4b`; if you change `TASK_CLASSIFIER_MODEL`, pull that model instead. WAHA uses its own `.waha/.env` configuration. The app defaults to stub mode. To connect it to WAHA, use the configuration below. Container restarts discard its in-memory state.
+Run `docker compose up -d --build` to start the app, Hermes stub, WAHA, and Ollama ROCm. Pull the configured classifier model once with `docker compose exec ollama ollama pull gemma4:e4b`; if you change `TASK_CLASSIFIER_MODEL`, pull that model instead. WAHA uses its own `.waha/.env` configuration. The app defaults to stub mode. SQLite data stays in the repository's `data/` directory across container restarts; memory storage does not. To connect it to WAHA, use the configuration below.
 
 Inside Docker, the app listens on `0.0.0.0:9005`; Compose publishes it on host port 9005. The Hermes stub is published on loopback port 8643. For local startup, `HOST` can override the default `127.0.0.1` bind address.
 
@@ -167,7 +172,7 @@ Call `GET /conversations?platform=waha` to discover contacts before creating tas
 
 Inbound `message` and `message.any` events share deduplication by provider message ID. Outgoing messages, other sessions, groups, unmapped phone identifiers, empty text, and unrelated events return `IGNORED_EVENT`. WAHA tasks are keyed by LID and sent directly using that LID; media downloads and group messaging are not implemented. Incoming text or media captions use the normal task reply flow. Stub simulation endpoints remain available alongside WAHA.
 
-Contacts, task state, message history, and deduplication remain in memory. A successful send means WAHA accepted the API request; it does not confirm WhatsApp delivery. Provider requests time out after 15 seconds and are not automatically retried, since retrying a send may duplicate a message.
+Contacts, task state, message history, and deduplication use the configured store. A successful send means WAHA accepted the API request; it does not confirm WhatsApp delivery. Provider requests time out after 15 seconds and are not automatically retried, since retrying a send may duplicate a message.
 
 ## Request logs
 

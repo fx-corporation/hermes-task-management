@@ -11,7 +11,7 @@ export function completeTaskHandler(
     const taskId = context.req.param("taskId");
     const body = await readObject(context);
     exactKeys(body, ["result"]);
-    const task = service.completeTask(
+    const task = await service.completeTask(
       taskId,
       requiredString(body.result, "result"),
     );

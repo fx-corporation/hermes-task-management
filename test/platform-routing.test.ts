@@ -17,7 +17,7 @@ test("routes identical contacts and message IDs independently across registered 
     if (String(url).includes("sendText")) { sends.push(JSON.parse(init!.body as string)); return Response.json({ id: "sent" }); }
     return Response.json([{ id: "12025550101@lid", name: "WhatsApp Dental" }]);
   }) as typeof fetch });
-  const app = createApplication({ apiToken: "api", webhookToken: "unused", webhookTokens: { stub: "stub-hook", waha: "waha-hook" }, store, platforms: [waha], hermes: new HttpHermesAdapter({ baseUrl: hermes.url.toString(), apiKey: "hermes" }) });
+  const app = await createApplication({ apiToken: "api", webhookToken: "unused", webhookTokens: { stub: "stub-hook", waha: "waha-hook" }, store, platforms: [waha], hermes: new HttpHermesAdapter({ baseUrl: hermes.url.toString(), apiKey: "hermes" }) });
   const call = async (path: string, body?: unknown, token = "api") => {
     const response = await fetchApplication(app, new Request(`http://localhost${path}`, {
       method: body === undefined ? "GET" : "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body),
@@ -64,7 +64,7 @@ test("routes identical contacts and message IDs independently across registered 
 });
 
 test("unconfigured WAHA remains registered and cannot leak stub contacts or accept empty webhook credentials", async () => {
-  const app = createApplication({ apiToken: "api", webhookToken: "", webhookTokens: { stub: "", waha: "" }, hermes: new InMemoryHermesAdapter() });
+  const app = await createApplication({ apiToken: "api", webhookToken: "", webhookTokens: { stub: "", waha: "" }, hermes: new InMemoryHermesAdapter() });
   const request = (path: string, token: string) => fetchApplication(app, new Request(`http://localhost${path}`, { headers: { authorization: `Bearer ${token}` } }));
   expect(app.platforms.get("waha").platform).toBe("waha");
   expect((await request("/conversations?platform=waha", "api")).status).toBe(503);

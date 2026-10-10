@@ -1,4 +1,4 @@
-import type { InMemoryStore } from "../storage/store.ts";
+import type { Store } from "../storage/store.ts";
 
 export interface HttpTaskClassifierOptions {
   baseUrl: string;
@@ -6,7 +6,7 @@ export interface HttpTaskClassifierOptions {
   classifierBaseUrl?: string;
   classifierApiKey?: string;
   trackerUrl: string;
-  store: InMemoryStore;
+  store: Store;
   model?: string;
   threshold?: number;
   timeoutMs?: number;

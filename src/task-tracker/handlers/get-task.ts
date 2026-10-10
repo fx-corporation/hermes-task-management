@@ -7,6 +7,6 @@ export function getTaskHandler(
 ): Handler<ApplicationEnv, "/tasks/:taskId"> {
   return async (context) => {
     const taskId = context.req.param("taskId");
-    return context.json({ success: true, task: service.getTask(taskId) });
+    return context.json({ success: true, task: await service.getTask(taskId) });
   };
 }

@@ -5,19 +5,18 @@ import { type InboundMessage } from "../../domain/inbound-message.ts";
 import { type MessagingTask } from "../../domain/messaging-task.ts";
 import type { PlatformAdapter } from "../platform-adapter.ts";
 import { PLATFORM } from "../../domain/platform.ts";
-import { InMemoryStore } from "../../storage/store.ts";
+import type { Store } from "../../storage/store.ts";
 import { isRecord, requiredString } from "../../validation.ts";
 
 export class StubPlatformAdapter implements PlatformAdapter {
   readonly platform = PLATFORM;
 
-  constructor(private readonly store: InMemoryStore) {}
+  constructor(private readonly store: Store) {}
 
-  listConversations(search?: string): Conversation[] {
+  async listConversations(search?: string): Promise<Conversation[]> {
     const normalized = search?.trim().toLocaleLowerCase();
-    return [...this.store.conversations.values()]
+    return (await this.store.listConversations(this.platform))
       .filter((conversation) => {
-        if (conversation.platform !== this.platform) return false;
         if (!normalized) return true;
         return `${conversation.displayName} ${conversation.conversationId}`
           .toLocaleLowerCase()
@@ -30,7 +29,7 @@ export class StubPlatformAdapter implements PlatformAdapter {
     task: MessagingTask,
     _message: string,
   ): Promise<{ acceptedAt: string }> {
-    if (!this.store.getConversation(task.platform, task.conversationId)) {
+    if (!await this.store.getConversation(task.platform, task.conversationId)) {
       throw new ApiError(
         502,
         "MESSAGE_SEND_FAILED",
@@ -40,7 +39,7 @@ export class StubPlatformAdapter implements PlatformAdapter {
     return { acceptedAt: new Date().toISOString() };
   }
 
-  normalizeInbound(payload: unknown): InboundMessage {
+  async normalizeInbound(payload: unknown): Promise<InboundMessage> {
     if (!isRecord(payload))
       throw invalidRequest("The webhook body must be a JSON object.");
     const conversationId = requiredString(
@@ -52,7 +51,19 @@ export class StubPlatformAdapter implements PlatformAdapter {
       "externalMessageId",
     );
     const content = requiredString(payload.message, "message");
-    const conversation = this.store.getConversation(PLATFORM, conversationId);
+    return {
+      platform: PLATFORM,
+      conversationId,
+      externalMessageId,
+      senderId: conversationId,
+      senderDisplayName: conversationId,
+      content,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  async prepareInbound(message: InboundMessage): Promise<void> {
+    const conversation = await this.store.getConversation(PLATFORM, message.conversationId);
     if (!conversation)
       throw new ApiError(
         404,
@@ -60,14 +71,6 @@ export class StubPlatformAdapter implements PlatformAdapter {
         "The requested conversation does not exist.",
       );
 
-    return {
-      platform: PLATFORM,
-      conversationId,
-      externalMessageId,
-      senderId: conversationId,
-      senderDisplayName: conversation.displayName,
-      content,
-      timestamp: new Date().toISOString(),
-    };
+    message.senderDisplayName = conversation.displayName;
   }
 }

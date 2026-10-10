@@ -6,7 +6,7 @@ import { InMemoryHermesAdapter } from "../src/task-tracker/adapters.ts";
 import { InMemoryStore } from "../src/task-tracker/store.ts";
 import { WahaPlatformAdapter } from "../src/task-tracker/waha-adapter.ts";
 
-function setup(hmacKey?: string, failSend = false) {
+async function setup(hmacKey?: string, failSend = false) {
   const store = new InMemoryStore(false);
   const calls: { url: string; init?: RequestInit }[] = [];
   const http = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -19,13 +19,13 @@ function setup(hmacKey?: string, failSend = false) {
     ]);
   }) as typeof fetch;
   const platform = new WahaPlatformAdapter(store, { baseUrl: "http://waha:3000", apiKey: "secret", session: "default", hmacKey, fetch: http });
-  const app = createApplication({ apiToken: "api", webhookToken: "hook", store, platform, hermes: new InMemoryHermesAdapter() });
+  const app = await createApplication({ apiToken: "api", webhookToken: "hook", store, platform, hermes: new InMemoryHermesAdapter() });
   const request = (path: string, body?: unknown, token = "api") => fetchApplication(app, new Request(`http://localhost${path}`, {
     method: body === undefined ? "GET" : "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   }));
-  return { app, platform, calls, request };
+  return { app, platform, calls, request, store };
 }
 const event = {
   event: "message", session: "default", timestamp: 1741249702485,
@@ -34,7 +34,7 @@ const event = {
 
 describe("WAHA adapter", () => {
   test("discovers contacts, sends to the task destination, and deduplicates replies", async () => {
-    const { app, request, calls } = setup();
+    const { app, request, calls } = await setup();
     const contacts = await (await request("/conversations?platform=waha&search=dental")).json() as any;
     expect(contacts.conversations).toEqual([{ platform: "waha", conversationId: "12025550101@lid", displayName: "Dental" }]);
     expect(new Headers(calls[0]!.init!.headers).get("x-api-key")).toBe("secret");
@@ -50,14 +50,14 @@ describe("WAHA adapter", () => {
     const deliveries = (app.hermes as InMemoryHermesAdapter).deliveries;
     expect(deliveries).toHaveLength(1);
     expect(deliveries[0]!.envelope).toContain("Platform: WAHA");
-    expect(app.store.inboundEvents.values().next().value!.message.timestamp).toBe("2022-11-04T11:31:25.000Z");
+    expect((await app.store.getInboundEvent(`waha${String.fromCharCode(0)}provider-message`))?.message.timestamp).toBe("2022-11-04T11:31:25.000Z");
     expect((await request("/conversations/12025550101%40lid/actions?platform=waha")).status).toBe(200);
     expect((await request("/conversations?platform=stub")).status).toBe(200);
     expect((await request("/stub/conversations", { conversationId: "+12025550103", displayName: "Fake" })).status).toBe(201);
   });
 
   test("ignores unrelated sessions, outgoing, group, unmapped phone, and non-text events", async () => {
-    const { app, request } = setup();
+    const { app, store, request } = await setup();
     for (const body of [
       { ...event, event: "session.status" }, { ...event, session: "other" },
       { ...event, payload: { ...event.payload, fromMe: true } },
@@ -67,13 +67,13 @@ describe("WAHA adapter", () => {
     ]) {
       expect((await (await request("/webhooks/waha", body, "hook")).json() as any).outcome).toBe("IGNORED_EVENT");
     }
-    expect(app.store.inboundEvents.size).toBe(0);
+    expect(await store.getInboundEvent(`waha${String.fromCharCode(0)}provider-message`)).toBeUndefined();
     expect((await request("/webhooks/waha", event, "api")).status).toBe(401);
     expect((await request("/webhooks/waha", { ...event, payload: { ...event.payload, timestamp: "bad" } }, "hook")).status).toBe(400);
   });
 
   test("verifies SHA-512 HMAC over the exact raw body", async () => {
-    const { app } = setup("hmac-secret");
+    const { app } = await setup("hmac-secret");
     const raw = JSON.stringify(event, null, 2);
     const signed = (body: string, signature: string) => fetchApplication(app, new Request("http://localhost/webhooks/waha", {
       method: "POST", body,
@@ -86,14 +86,14 @@ describe("WAHA adapter", () => {
   });
 
   test("provider send failure leaves the task active without recording a send", async () => {
-    const { app, request } = setup(undefined, true);
+    const { app, request } = await setup(undefined, true);
     await request("/conversations?platform=waha");
     const { task } = await (await request("/tasks", { platform: "waha", conversationId: "12025550101@lid", hermesSessionId: "hermes", description: "Book" })).json() as any;
     const response = await request(`/tasks/${task.id}`, { platform: "waha", conversationId: task.conversationId, message: "Hello", description: "Updated details" });
     expect(response.status).toBe(502);
     expect((await response.json() as any).error.code).toBe("MESSAGE_SEND_FAILED");
-    expect(app.service.getTask(task.id).status).toBe("ACTIVE");
-    expect(app.store.getConversationActions("waha", task.conversationId)).toHaveLength(0);
+    expect((await app.service.getTask(task.id)).status).toBe("ACTIVE");
+    expect(await app.store.getConversationActions("waha", task.conversationId)).toHaveLength(0);
   });
 });
 
@@ -110,8 +110,8 @@ test("discovers phone-addressed contacts as LIDs and sends directly to the LID",
   }) as typeof fetch });
   expect(await adapter.listConversations()).toEqual([{ platform: "waha", conversationId: "999111222@lid", displayName: "Dental" }]);
   expect(calls[1]).toContain("/api/test-session/lids/pn/12025550101%40c.us");
-  const app = createApplication({ apiToken: "api", webhookToken: "hook", store, platforms: [adapter], hermes: new InMemoryHermesAdapter() });
-  const task = app.service.createTask({ platform: "waha", conversationId: "999111222@lid", hermesSessionId: "session", description: "Book" });
+  const app = await createApplication({ apiToken: "api", webhookToken: "hook", store, platforms: [adapter], hermes: new InMemoryHermesAdapter() });
+  const task = await app.service.createTask({ platform: "waha", conversationId: "999111222@lid", hermesSessionId: "session", description: "Book" });
   await app.service.sendMessage(task.id, { platform: "waha", conversationId: task.conversationId, message: "Hello", description: "Latest state" });
   const reply = await app.service.receiveInbound("waha", { ...event, session: "test-session", payload: { ...event.payload, from: "999111222@lid" } });
   expect(reply.outcome).toBe("DELIVERED");
@@ -119,7 +119,7 @@ test("discovers phone-addressed contacts as LIDs and sends directly to the LID",
 });
 
 test("WAHA API requires LIDs for task creation, filters, and action history", async () => {
-  const { request } = setup();
+  const { request } = await setup();
   await request("/conversations?platform=waha");
   for (const conversationId of ["+12025550101", "12025550101@c.us", "123@g.us", "abc@lid"]) {
     expect((await request("/tasks", { platform: "waha", conversationId, hermesSessionId: "s", description: "Test" })).status).toBe(400);

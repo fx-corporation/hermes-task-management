@@ -15,7 +15,7 @@ test("UI API creates, sends through WAHA, displays authenticated webhook replies
     return Response.json([{ id: "12025550101@lid", name: "Dental" }]);
   }) as typeof fetch });
   let stubUrl = "";
-  const app = createApplication({ apiToken: "api-secret", webhookToken: "hook-secret", store, platform, hermes: {
+  const app = await createApplication({ apiToken: "api-secret", webhookToken: "hook-secret", store, platform, hermes: {
     async deliver(delivery) { await new HttpHermesAdapter({ baseUrl: stubUrl, apiKey: "dev" }).deliver(delivery); },
   } });
   const tracker = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: app.app.fetch, idleTimeout: 0 });
@@ -102,7 +102,7 @@ test("stub proxy preserves signed WAHA bytes and authentication through both Hon
   const store = new InMemoryStore(false);
   const platform = new WahaPlatformAdapter(store, { baseUrl: "http://waha", apiKey: "", hmacKey: "test-hmac" });
   const hermes = new InMemoryHermesAdapter();
-  const app = createApplication({ apiToken: "api", webhookToken: "", store, platform, hermes });
+  const app = await createApplication({ apiToken: "api", webhookToken: "", store, platform, hermes });
   const tracker = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: app.app.fetch });
   const stub = startHermesStub({ port: 0, taskTrackerUrl: tracker.url.toString(), log: () => {} });
   const raw = JSON.stringify({ event: "message", session: "default", payload: {
